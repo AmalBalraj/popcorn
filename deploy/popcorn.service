@@ -1,0 +1,28 @@
+[Unit]
+Description=Popcorn web application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=amal
+Group=amal
+WorkingDirectory=/home/amal/popcorn
+Environment=PYTHONUNBUFFERED=1
+Environment=POPCORN_SECURE_COOKIE=1
+Environment=POPCORN_DEFAULT_UPLOAD=gdrive:Movies
+EnvironmentFile=/etc/popcorn.env
+# One worker owns download subprocesses; extra threads keep UI/API requests
+# responsive while searches and uploads are waiting on external services.
+ExecStart=/home/amal/.local/bin/gunicorn --workers 1 --threads 16 --bind 127.0.0.1:5050 --timeout 300 web_app:app
+Restart=on-failure
+RestartSec=5
+
+# Basic service hardening while retaining write access for downloads/settings.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/amal/popcorn
+
+[Install]
+WantedBy=multi-user.target

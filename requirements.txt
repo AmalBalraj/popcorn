@@ -1,0 +1,6 @@
+requests[socks]>=2.31
+beautifulsoup4>=4.12
+Flask>=3.0,<4
+gunicorn>=23.0,<24
+# Only needed to generate clips for films that have no subtitles at all.
+faster-whisper>=1.0

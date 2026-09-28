@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% set active_page = 'downloads' %}
+{% block title %}Downloads — Popcorn{% endblock %}
+
+{% block content %}
+  <div class="shell page">
+    <div class="page-head">
+      <h1>Downloads</h1>
+      <p>Titles on their way to your library, and everything you have fetched before.</p>
+    </div>
+
+    <div class="downloads-toolbar">
+      <div class="segmented" role="tablist" aria-label="Filter downloads">
+        <button type="button" role="tab" id="tab-active" aria-selected="true">Active</button>
+        <button type="button" role="tab" id="tab-history" aria-selected="false">History</button>
+      </div>
+      <span class="spacer"></span>
+      <span class="browse-count" id="downloads-count"></span>
+    </div>
+
+    <div class="download-list" id="downloads-list" aria-live="polite"></div>
+    <div id="downloads-state"></div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script type="module" src="{{ url_for('static', filename='js/pages/downloads.js') }}"></script>
+{% endblock %}

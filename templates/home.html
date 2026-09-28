@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% set active_page = 'home' %}
+{% block title %}Popcorn — your cinema{% endblock %}
+{% block body_class %}page-home{% endblock %}
+{% block header_class %}is-over-hero{% endblock %}
+
+{% block content %}
+  <div id="home-hero"></div>
+  <div class="shell home-rows" id="home-rows"></div>
+  <div class="shell" id="home-empty"></div>
+{% endblock %}
+
+{% block scripts %}
+  <script type="module" src="{{ url_for('static', filename='js/pages/home.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,378 @@
+{% extends "base.html" %}
+{% set active_page = 'settings' %}
+{% block title %}Settings — Popcorn{% endblock %}
+
+{% block content %}
+  <div class="shell page">
+    <div class="page-head">
+      <h1>Settings</h1>
+      <p>Playback, downloads, your account, and the server behind them.</p>
+    </div>
+
+    <div class="settings-layout">
+      <nav class="settings-nav" aria-label="Settings sections">
+        <a href="#playback">Playback</a>
+        <a href="#downloads">Downloads</a>
+        <a href="#account">Account</a>
+        {% if account.is_admin %}
+          <div class="settings-nav-group">Administration</div>
+          <a href="#server">Server</a>
+          <a href="#library">Library</a>
+          <a href="#members">Members</a>
+        {% endif %}
+      </nav>
+
+      <div class="settings-content">
+      <form id="settings-form" novalidate>
+        <section class="settings-section" id="playback">
+          <header>
+            <h2>Playback</h2>
+            <p>How subtitles behave when you press play. These are applied to your Jellyfin profile too, so they hold wherever you watch.</p>
+          </header>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <label class="settings-label" for="subtitle_language">
+                <strong>Subtitle language</strong>
+                <small>Preferred track when a title offers several.</small>
+              </label>
+              <div class="settings-control">
+                <select class="select" name="subtitle_language" id="subtitle_language" aria-label="Subtitle language"></select>
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="subtitle_mode">
+                <strong>When to show subtitles</strong>
+                <small>Forced-only shows subtitles just for foreign-language dialogue.</small>
+              </label>
+              <div class="settings-control">
+                <select class="select" name="subtitle_mode" id="subtitle_mode">
+                  {% for mode in ['Always', 'Default', 'OnlyForced', 'None'] %}
+                    <option value="{{ mode }}" {{ 'selected' if settings.subtitle_mode == mode }}>{{ mode }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-section" id="downloads">
+          <header>
+            <h2>Downloads</h2>
+            <p>Where new titles go, and how Popcorn looks for them. These are the defaults new downloads use.</p>
+          </header>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <label class="settings-label" for="default_upload">
+                <strong>Save downloads to</strong>
+                <small>A rclone destination such as <code>gdrive:Movies</code>, or leave blank to keep files on this server.</small>
+              </label>
+              <div class="settings-control">
+                <input class="input" name="default_upload" id="default_upload" value="{{ settings.default_upload }}" spellcheck="false">
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="default_source">
+                <strong>Preferred source</strong>
+                <small>Which index Popcorn searches first. “All sources” is slower but thorough.</small>
+              </label>
+              <div class="settings-control">
+                <select class="select" name="default_source" id="default_source">
+                  {% for value, label in [
+                    ('regional', 'Indian & regional'), ('tpb', 'The Pirate Bay'), ('rarbg', 'RARBG'),
+                    ('yts', 'YTS'), ('tgx', 'TorrentGalaxy'), ('torrents-csv', 'Torrents-CSV'), ('all', 'All sources')
+                  ] %}
+                    <option value="{{ value }}" {{ 'selected' if settings.default_source == value }}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="search_timeout">
+                <strong>Search timeout</strong>
+                <small>How long to wait for a slow index before giving up.</small>
+              </label>
+              <div class="settings-control">
+                <select class="select" name="search_timeout" id="search_timeout">
+                  {% for seconds in (10, 15, 30, 60) %}
+                    <option value="{{ seconds }}" {{ 'selected' if settings.search_timeout == seconds }}>{{ seconds }} seconds</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="private_dns">
+                <strong>Use private DNS</strong>
+                <small>Resolves index sites through Cloudflare. Needed when your network blocks them.</small>
+              </label>
+              <div class="settings-control is-inline">
+                <label class="switch">
+                  <input type="checkbox" name="private_dns" id="private_dns" {{ 'checked' if settings.private_dns }}>
+                  <span class="switch-track"></span>
+                  <span class="switch-text"><strong id="private_dns_label">{{ 'On' if settings.private_dns else 'Off' }}</strong></span>
+                </label>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-section" id="clips">
+          <header>
+            <h2>AI clips</h2>
+            <p>How Popcorn cuts short clips from a film. Clip generation runs on the server in the
+              background, and the scenes it finds are remembered per movie, so these can be changed
+              and clips regenerated without paying for the analysis again.</p>
+          </header>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <label class="settings-label" for="clip_target_count">
+                <strong>Clips per movie</strong>
+                <small>The most clips Popcorn will make from one film.</small>
+              </label>
+              <div class="settings-control">
+                <select class="select" name="clip_target_count" id="clip_target_count">
+                  {% for count in (5, 8, 10, 12, 15, 20) %}
+                    <option value="{{ count }}" {{ 'selected' if settings.clip_target_count == count }}>{{ count }} clips</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="clip_min_seconds">
+                <strong>Shortest clip</strong>
+                <small>Clips shorter than this are stretched to the next line or dropped.</small>
+              </label>
+              <div class="settings-control">
+                <select class="select" name="clip_min_seconds" id="clip_min_seconds">
+                  {% for seconds in (12, 15, 20, 30, 45) %}
+                    <option value="{{ seconds }}" {{ 'selected' if settings.clip_min_seconds == seconds }}>{{ seconds }} seconds</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="clip_max_seconds">
+                <strong>Longest clip</strong>
+                <small>Longer scenes are trimmed back to a line inside the limit.</small>
+              </label>
+              <div class="settings-control">
+                <select class="select" name="clip_max_seconds" id="clip_max_seconds">
+                  {% for seconds in (45, 60, 75, 90, 120) %}
+                    <option value="{{ seconds }}" {{ 'selected' if settings.clip_max_seconds == seconds }}>{{ seconds }} seconds</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="clip_vision">
+                <strong>Look at the best scenes</strong>
+                <small>A vision model reviews stills from the strongest candidates before the final
+                  cut. Costs one extra model call per movie; turning it off ranks on dialogue alone.</small>
+              </label>
+              <div class="settings-control is-inline">
+                <label class="switch">
+                  <input type="checkbox" name="clip_vision" id="clip_vision" {{ 'checked' if settings.clip_vision }}>
+                  <span class="switch-track"></span>
+                  <span class="switch-text"><strong id="clip_vision_label">{{ 'On' if settings.clip_vision else 'Off' }}</strong></span>
+                </label>
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="clip_subtitle_download">
+                <strong>Look for subtitles online</strong>
+                <small>When a film has no subtitles at all, ask your media server's subtitle
+                  providers. A subtitle that does not match the film's timing is discarded;
+                  one that does is saved beside the film. Needs a provider configured in
+                  Jellyfin (Open Subtitles, with an account).</small>
+              </label>
+              <div class="settings-control is-inline">
+                <label class="switch">
+                  <input type="checkbox" name="clip_subtitle_download" id="clip_subtitle_download" {{ 'checked' if settings.clip_subtitle_download }}>
+                  <span class="switch-track"></span>
+                  <span class="switch-text"><strong id="clip_subtitle_download_label">{{ 'On' if settings.clip_subtitle_download else 'Off' }}</strong></span>
+                </label>
+              </div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="clip_whisper_model">
+                <strong>Speech model</strong>
+                <small>Used only for films with no subtitles at all, which have to be transcribed
+                  before anything can be chosen. Larger is slower and more accurate.</small>
+              </label>
+              <div class="settings-control">
+                <select class="select" name="clip_whisper_model" id="clip_whisper_model">
+                  {% for model in ('tiny', 'base', 'small', 'medium') %}
+                    <option value="{{ model }}" {{ 'selected' if settings.clip_whisper_model == model }}>{{ model }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div class="settings-section" style="margin-top:var(--s5)">
+          <div style="display:flex;align-items:center;gap:var(--s4);justify-content:flex-end">
+            <span class="t-mute t-xs" id="settings-status" role="status"></span>
+            <button class="btn btn-primary" type="submit"><span>Save changes</span></button>
+          </div>
+        </div>
+      </form>
+
+      <section class="settings-section" id="account">
+        <header>
+          <h2>Account</h2>
+          <p>Signed in as <strong>{{ account.username or 'a Popcorn member' }}</strong>{% if account.is_admin %} · administrator{% endif %}.</p>
+        </header>
+        <div class="settings-rows">
+          <div class="settings-row">
+            <div class="settings-label">
+              <strong>Password</strong>
+              <small>Changes the password for your Popcorn and Jellyfin account.</small>
+            </div>
+            <div class="settings-control">
+              <form id="password-form" style="display:grid;gap:var(--s2)">
+                <input class="input" name="current_password" type="password" autocomplete="current-password" placeholder="Current password" aria-label="Current password" required>
+                <input class="input" name="new_password" type="password" autocomplete="new-password" placeholder="New password (8+ characters)" aria-label="New password" required minlength="8">
+                <div style="display:flex;align-items:center;gap:var(--s3)">
+                  <button class="btn btn-outline btn-sm" type="submit">Change password</button>
+                  <span class="form-status t-mute t-xs"></span>
+                </div>
+              </form>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-label">
+              <strong>Watch history</strong>
+              <small>Clears played flags and resume positions across every device.</small>
+            </div>
+            <div class="settings-control is-inline">
+              <button class="btn btn-quiet-danger" id="clear-history" type="button">Clear watch history</button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-label">
+              <strong>Jellyfin</strong>
+              <small>The full Jellyfin interface, for anything Popcorn does not cover.</small>
+            </div>
+            <div class="settings-control is-inline">
+              <a class="btn btn-outline btn-sm" href="/watch">Open Jellyfin</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {% if account.is_admin %}
+      <section class="settings-section" id="server">
+        <header>
+          <h2>Server</h2>
+          <p>What Popcorn is connected to and how much is stored there.</p>
+        </header>
+        <div class="settings-rows">
+          <div class="settings-row">
+            <div class="settings-label">
+              <strong>Library</strong>
+              <small id="stats-summary">Reading your library…</small>
+            </div>
+            <div class="settings-control is-inline">
+              <button class="btn btn-outline btn-sm" id="refresh-library" type="button">Rescan library</button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-label">
+              <strong>Preview thumbnails</strong>
+              <small>Generates the hover previews on the player timeline. Runs in the background.</small>
+            </div>
+            <div class="settings-control is-inline">
+              <button class="btn btn-outline btn-sm" id="trickplay" type="button">Generate previews</button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-label">
+              <strong>Storage locations</strong>
+              <small>Folders Popcorn manages and the destination downloads are moved to.</small>
+            </div>
+            <div class="settings-control">
+              <div class="t-mono t-dim" id="stats-folders">—</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-section" id="library">
+        <header>
+          <h2>Library</h2>
+          <p>Housekeeping for the files themselves.</p>
+        </header>
+        <div class="settings-rows">
+          <div class="settings-row is-stacked">
+            <div class="settings-label">
+              <strong>Title details</strong>
+              <small>Titles downloaded as release folders sometimes arrive without a description, genres or artwork. Popcorn can ask your metadata provider to identify them, and you choose what to apply.</small>
+            </div>
+            <div class="settings-control">
+              <div style="display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap">
+                <button class="btn btn-outline btn-sm" id="scan-metadata" type="button">Check for missing details</button>
+                <span class="t-mute t-xs" id="metadata-status"></span>
+              </div>
+              <div id="metadata-results" style="margin-top:var(--s4)"></div>
+            </div>
+          </div>
+
+          <div class="settings-row is-stacked">
+            <div class="settings-label">
+              <strong>Artwork</strong>
+              <small>Fills in missing posters from TMDB. Requires a TMDB key in the server environment.</small>
+            </div>
+            <div class="settings-control">
+              <div style="display:flex;align-items:center;gap:var(--s3)">
+                <button class="btn btn-outline btn-sm" id="repair-posters" type="button">Repair missing posters</button>
+                <span class="t-mute t-xs" id="poster-status"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-row is-stacked">
+            <div class="settings-label">
+              <strong>Delete media</strong>
+              <small>Removes the title from your library and deletes the media file. This cannot be undone.</small>
+            </div>
+            <div class="settings-control">
+              <div class="list maintenance-list" id="movie-list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-section" id="members">
+        <header>
+          <h2>Members</h2>
+          <p>Everyone with access. Each member has their own watch history and resume positions.</p>
+        </header>
+        <div class="settings-rows">
+          <div class="settings-row is-stacked">
+            <div class="settings-label"><strong>Add a member</strong><small>They can search, download and watch. Only administrators can delete media.</small></div>
+            <div class="settings-control">
+              <form id="account-form" style="display:grid;grid-template-columns:1fr 1fr auto;gap:var(--s3);align-items:center">
+                <input class="input" name="name" placeholder="Username" aria-label="New member username" autocomplete="off" required>
+                <input class="input" name="password" type="password" placeholder="Password (8+ characters)" aria-label="New member password" autocomplete="new-password" required minlength="8">
+                <button class="btn btn-primary btn-sm" type="submit">Create</button>
+                <span class="form-status t-mute t-xs" style="grid-column:1/-1"></span>
+              </form>
+            </div>
+          </div>
+          <div class="settings-row is-stacked">
+            <div class="settings-label"><strong>Current members</strong></div>
+            <div class="settings-control">
+              <div class="list maintenance-list" id="account-list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      {% endif %}
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script type="module" src="{{ url_for('static', filename='js/pages/settings.js') }}"></script>
+{% endblock %}

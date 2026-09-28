@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% set active_page = page %}
+{% block title %}{{ heading }} — Popcorn{% endblock %}
+
+{% block content %}
+  <div class="shell page" data-library-type="{{ library_type }}" data-filter="{{ filter or '' }}">
+    <div class="page-head">
+      <h1>{{ heading }}</h1>
+      <p id="browse-summary">{{ blurb }}</p>
+    </div>
+
+    <div class="browse-toolbar">
+      <label class="sr-only" for="browse-sort">Sort</label>
+      <select class="select" id="browse-sort" style="width:auto;min-width:180px">
+        <option value="added">Recently added</option>
+        <option value="title">Title A–Z</option>
+        <option value="year">Newest first</option>
+        <option value="rating">Highest rated</option>
+        <option value="runtime">Longest</option>
+      </select>
+      <span class="spacer"></span>
+      <span class="browse-count" id="browse-count"></span>
+    </div>
+
+    <div class="genre-strip" id="browse-genres" role="group" aria-label="Filter by genre"></div>
+
+    <div class="grid" id="browse-grid" aria-busy="true"></div>
+    <div id="browse-state"></div>
+
+    <div style="display:flex;justify-content:center;margin-top:var(--s7)">
+      <button class="btn btn-outline" id="browse-more" type="button" hidden>Load more</button>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script type="module" src="{{ url_for('static', filename='js/pages/browse.js') }}"></script>
+{% endblock %}

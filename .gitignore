@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.aria2
+*.part
+*.mkv
+*.mp4
+*.avi
+*.zipx
+popcorn-*/
+data/*.sqlite3
+backups/

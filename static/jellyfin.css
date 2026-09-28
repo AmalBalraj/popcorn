@@ -1,0 +1,23 @@
+/* Popcorn skin for the Jellyfin client embedded by /watch. */
+:root { --popcorn-paper: #f2f0e9; --popcorn-acid: #d9ff43; --popcorn-orange: #ff5a28; }
+html, body, .backgroundContainer, .mainAnimatedPages { background: #0b0b0c !important; }
+body { color: var(--popcorn-paper) !important; font-family: Manrope, system-ui, sans-serif !important; }
+/* The Popcorn shell owns the brand; suppress Jellyfin logos without hiding player controls. */
+.splashLogo, .pageTitleWithDefaultLogo, .pageTitleWithLogo, .imgLogoIcon,
+.headerLogo, [class*="jellyfinLogo"], [class*="JellyfinLogo"] { background-image: none !important; display: none !important; }
+.pageTitle { color: var(--popcorn-paper) !important; }
+.skinHeader, .skinHeader-withBackground { background: rgba(11,11,12,.96) !important; box-shadow: none !important; border-bottom: 1px solid rgba(242,240,233,.12); }
+.headerTabs.sectionTabs { text-transform: uppercase; letter-spacing: .1em; font-size: 11px; }
+.emby-tab-button-active { color: var(--popcorn-paper) !important; }
+.emby-tab-button-active::after, .mdl-slider-background-lower { background: var(--popcorn-acid) !important; }
+.raised.button-submit, .fab, .button-accent, .playstatebutton-icon-played { background: var(--popcorn-acid) !important; color: #0b0b0c !important; }
+.cardBox { border: 1px solid rgba(242,240,233,.1); background: rgba(255,255,255,.025); }
+.cardImageContainer { background-color: #171719 !important; }
+.cardImageContainer:not([style*="background-image"]) { background-image: radial-gradient(circle at 70% 20%, rgba(217,255,67,.12), transparent 28%), linear-gradient(145deg, #1d1d20, #101011); }
+.cardOverlayContainer { background: rgba(11,11,12,.66); }
+.cardText { color: var(--popcorn-paper); }
+.sectionTitle, .itemName, h1, h2, h3 { letter-spacing: -.03em; }
+.detailPagePrimaryContainer { background: linear-gradient(0deg,#0b0b0c 4%,transparent 70%); }
+.dialog, .formDialogHeader, .formDialogFooter { background: #111112 !important; }
+.selectContainer, .inputContainer { color: var(--popcorn-paper); }
+.subtitleappearance-preview { border-color: var(--popcorn-acid) !important; }

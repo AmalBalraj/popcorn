@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% set active_page = 'search' %}
+{% block title %}Search — Popcorn{% endblock %}
+
+{% block content %}
+  <div class="shell page">
+    <div class="page-head" style="margin-bottom:var(--s5)">
+      <h1>Search</h1>
+    </div>
+
+    <form class="search-bar" id="search-form" role="search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <label class="sr-only" for="search-input">Search your library and available releases</label>
+      <input id="search-input" type="search" placeholder="Search films and series…" autocomplete="off"
+             autocapitalize="off" spellcheck="false" enterkeyhint="search" autofocus>
+      <button class="icon-btn" id="search-clear" type="button" aria-label="Clear search" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </form>
+
+    <div class="recent-searches" id="recent-searches" hidden></div>
+
+    <div id="search-results"></div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script type="module" src="{{ url_for('static', filename='js/pages/search.js') }}"></script>
+{% endblock %}

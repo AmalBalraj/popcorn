@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#08080a">
+  <link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='icon-192.png') }}">
+  <link rel="icon" href="{{ url_for('static', filename='icon.svg') }}" type="image/svg+xml">
+  <title>Jellyfin — Popcorn</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}">
+</head>
+<body class="legacy-page">
+  <header class="legacy-bar">
+    <a class="icon-btn" href="/" aria-label="Back to Popcorn">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </a>
+    <div>
+      <h1><strong>Jellyfin</strong></h1>
+      <small>The full interface, for anything Popcorn doesn’t cover</small>
+    </div>
+    <a class="btn btn-outline btn-sm" href="/settings">Settings</a>
+  </header>
+
+  <main class="legacy-shell">
+    {% if jellyfin %}
+      <script>
+        (() => {
+          const server = {
+            Id: {{ jellyfin.get('server_id')|tojson }},
+            Name: 'Popcorn',
+            ManualAddress: `${location.origin}/jellyfin`,
+            LocalAddress: `${location.origin}/jellyfin`,
+            RemoteAddress: `${location.origin}/jellyfin`,
+            UserId: {{ jellyfin.get('user_id')|tojson }},
+            AccessToken: {{ jellyfin.get('token')|tojson }},
+            DateLastAccessed: Date.now()
+          };
+          localStorage.setItem('jellyfin_credentials', JSON.stringify({ Servers: [server] }));
+        })();
+      </script>
+      <iframe src="/jellyfin/web/{% if item_id %}#/details?id={{ item_id }}&amp;serverId={{ jellyfin.get('server_id') }}{% endif %}"
+              title="Jellyfin" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
+    {% else %}
+      <div class="state" data-tone="error">
+        <div class="state-mark">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 21.5 20h-19zM12 10v4M12 17v.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <h2>Jellyfin isn’t connected</h2>
+        <p>{{ jellyfin_error or 'Popcorn could not reach your media server with this account.' }} Sign out and back in to retry — your Popcorn password is also your Jellyfin password.</p>
+        <div class="state-actions">
+          <a class="btn btn-primary" href="/">Back to Popcorn</a>
+        </div>
+      </div>
+    {% endif %}
+  </main>
+</body>
+</html>

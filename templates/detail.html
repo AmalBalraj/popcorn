@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Loading… — Popcorn{% endblock %}
+{% block header_class %}is-over-hero{% endblock %}
+
+{% block content %}
+  <div id="detail" data-item-id="{{ item_id }}"></div>
+{% endblock %}
+
+{% block scripts %}
+  <script type="module" src="{{ url_for('static', filename='js/pages/detail.js') }}"></script>
+{% endblock %}

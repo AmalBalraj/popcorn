@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#08080a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='icon-192.png') }}">
+  <link rel="icon" href="{{ url_for('static', filename='icon.svg') }}" type="image/svg+xml">
+  <title>Sign in — Popcorn</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}">
+</head>
+<body class="auth-page">
+  <div class="grain" aria-hidden="true"></div>
+
+  <main class="auth">
+    <section class="auth-pitch" aria-hidden="false">
+      <a class="brand" href="/login" aria-label="Popcorn">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>pop<span style="color:var(--accent)">corn</span></span>
+      </a>
+      <div class="auth-copy">
+        <h1 class="t-display">Your cinema.<br><span style="color:var(--accent)">Your queue.</span></h1>
+        <p>Everything you own, ready to play — plus whatever you want to add next.</p>
+      </div>
+      <small class="t-label">One sign-in for searching, downloads and watching</small>
+    </section>
+
+    <section class="auth-form">
+      <form method="post" novalidate>
+        <h2 class="t-h1">Welcome back</h2>
+        <p class="t-dim">Sign in to continue watching.</p>
+
+        {% if error %}
+          <div class="auth-error" role="alert">
+            <svg viewBox="0 0 24 24" aria-hidden="true" width="17" height="17"><path d="M12 3.5 21.5 20h-19zM12 10v4M12 17v.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>{{ error }}</span>
+          </div>
+        {% endif %}
+
+        <div class="field" style="margin-top:var(--s6)">
+          <label for="username">Username</label>
+          <input class="input" id="username" name="username" autocomplete="username" required autofocus>
+        </div>
+        <div class="field" style="margin-top:var(--s4)">
+          <label for="password">Password</label>
+          <input class="input" id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+
+        <button class="btn btn-primary btn-lg btn-block" type="submit" style="margin-top:var(--s6)">
+          Sign in
+        </button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
