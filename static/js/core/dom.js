@@ -132,10 +132,12 @@ export function joinMeta(parts, separator = ' · ') {
 /** Debounce, for search-as-you-type. */
 export function debounce(fn, delay = 220) {
   let timer;
-  return (...args) => {
+  const debounced = (...args) => {
     clearTimeout(timer);
     timer = setTimeout(() => fn(...args), delay);
   };
+  debounced.cancel = () => clearTimeout(timer);
+  return debounced;
 }
 
 export function prefersReducedMotion() {

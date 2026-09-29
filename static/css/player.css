@@ -420,3 +420,10 @@
   .player-scrub { height: 30px; }
   .player-scrub-track { height: 5px; }
 }
+
+.player-tooltip { text-align: center; }
+.player-preview-image {
+  background-repeat: no-repeat;
+  border-radius: 3px;
+  margin: 0 0 5px;
+}

@@ -42,19 +42,22 @@ names live behind **Advanced release details**. Files are saved in this project
 directory by default, or moved to the rclone destination configured in
 **Settings → Downloads** (for example `gdrive:Movies`).
 
-**Indian & regional** is the default search source. It uses BitSearch's JSON
-API for direct info-hashes and is especially useful for Malayalam, Tamil,
-Telugu, Kannada, Hindi, Bengali, Marathi, and Punjabi releases. Search is
-spelling-tolerant and uses TMDB title/year aliases when the configured key is
-available. Results are cached for ten minutes to keep repeated searches fast
-and conserve the API's anonymous quota. An optional BitSearch API key can be
-added to `/etc/popcorn.env` as `POPCORN_BITSEARCH_API_KEY=...`; anonymous use
-works without one.
+Web searches aggregate all enabled sources concurrently, with a saved preferred
+source affecting ordering. A slow or broken source cannot fail the search.
+Results appear after useful answers arrive, within a configurable deadline;
+recent cached results provide a fallback during outages. Repeated failures open
+temporary circuits, and recovery probes restore providers and mirrors.
+
+**Indian & regional** uses BitSearch's JSON API and remains available. Spelling
+variants and cached TMDB canonical/original titles improve title matching.
+An optional `POPCORN_BITSEARCH_API_KEY` remains supported server-side.
 
 The other sources are **RARBG** (mainstream movie and TV releases, including
 2160p), **The Pirate Bay**, **YTS**, **TorrentGalaxy**, and **Torrents-CSV**
-(a DHT-scraped JSON index that covers regional titles well). All six work
-without an API key or a proxy. 1337x and TamilBlasters were dropped: 1337x
+(a DHT-scraped JSON index). These six existing adapters remain enabled by
+default; their current availability is reported at the admin-only
+`GET /api/admin/providers`. An optional **Torznab** adapter supports an
+operator-configured authorized index API. 1337x and TamilBlasters were dropped: 1337x
 answers every mirror with a Cloudflare challenge from a datacenter IP, and
 TamilBlasters' forum went down at the origin.
 
@@ -202,6 +205,40 @@ Clip generation is CPU-bound, so one film runs at a time; a second request
 joins the running job if it is for the same film, and is otherwise asked to
 wait. Uploading clips counts against the same Google Drive quota as downloads.
 
+### TV shows and episode previews
+
+TV imports use a separate `gdrive:TV Shows` library mounted by
+`deploy/popcorn-shows.service` at `/home/amal/gdrive-shows`. Movies continue to
+use `gdrive:Movies`. Imports identify the show by TMDB ID and organize each
+video under `Show (year) [tmdbid-ID]/Season XX/Show SxxExx - version.ext`.
+Separate releases join the same series and season; version suffixes preserve
+files from different sources. Matching subtitle sidecars keep their language
+and accessibility suffixes.
+
+The download picker always displays release size and offers automatic, movie,
+or TV classification. For TV, **Find show** lets you choose the provider's
+record and optionally specify a season when filenames omit it. Automatic
+matching accepts one exact normalized title match. Ambiguous identities,
+season numbers, or specials stay local with an **Identify show** action in
+Downloads; they are never uploaded as a guessed movie. Recovery keeps the
+original downloaded files until the normalized upload is committed.
+
+TV metadata, posters, backdrops and episode stills are saved alongside media,
+so the read-only mount does not need Jellyfin to fetch external metadata.
+`media_library.py` fetches bounded HTTPS requests with verified DNS fallback,
+keeps a persistent metadata cache, and never puts credentials in command-line
+arguments or diagnostics. The TV library reads those local metadata files.
+
+The player now shows scrub thumbnails from the negotiated media version.
+Existing thumbnails for migrated TV files are retained locally, and missing
+ones can be generated with `deploy/tv-library.py generate-missing-previews`.
+That command uses the existing Jellyfin ffmpeg installation. Image routes
+remain authenticated. The initial migration's file map and preview cache are
+under `data/tv-migration`; retain them while its preserved previews are used.
+
+Run `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q`,
+`node tests/test_search.mjs`, and `node tests/test_previews.mjs` for validation.
+
 ### Fixing mismatched titles
 
 Titles downloaded as release folders — `www.UIndex.org - Balan The Boy 2026
@@ -221,7 +258,7 @@ Completed downloads go to `gdrive:Movies` by default. The temporary local
 download directory is removed after a successful rclone upload; if a download
 or upload fails it is retained so the data is recoverable.
 
-Download progress and the latest 100 jobs are persisted in
+Download progress and job checkpoints are persisted in
 `data/popcorn.sqlite3`. Reloading the browser restores active progress polling
 and completed/failed history for the signed-in member; progress updates never
 change the page scroll. Terminal jobs clear transfer speed and ETA. Completed
@@ -233,7 +270,19 @@ directly. History entries can be removed without deleting their media.
 Active downloads appear under **Downloads** and can be stopped by their owner;
 stopping terminates the whole aria2/rclone process group and removes partial
 local data. Terminal jobs move to the **History** tab. A failed or interrupted
-download offers **Find again**, pre-filled with the same search.
+download offers **Find again**, pre-filled with the same search. New jobs resume
+their original aria2 state after restart. Failed uploads retry from the finished
+local files; indexing retries without downloading or uploading again. Pending
+retries offer **Retry now**. Stopping an upload retains its completed local copy.
+
+See [source reliability and configuration](docs/SOURCE_RELIABILITY.md) for the
+architecture, every environment option, migration behavior, and remaining
+limitations. Operational defaults require no additional configuration. Web
+searches use the host resolver without modifying process-wide DNS.
+
+Run the failure tests with `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q`.
+They include provider failures, cache/circuit recovery, upload/index isolation,
+subprocess reattachment, and actual aria2 resume with generated localhost data.
 
 The **Watch** page embeds the local Jellyfin service after Popcorn silently
 creates the matching Jellyfin session. Jellyfin reads a read-only
@@ -258,3 +307,33 @@ python3 popcorn.py "Inception 2010"
 ```
 
 Run `python3 popcorn.py --help` for all source, proxy, DNS, and upload options.
+
+
+### Automatic subtitle downloads
+
+Administrators can connect an OpenSubtitles.com account in **Settings → Subtitle
+downloads**. Supply a username, password and your API consumer key, then choose
+**Connect and enable**. The account is verified before saving. Connection enables
+subtitle fetching for new downloads and starts a background check of existing
+movies and episodes. **Find subtitles for existing videos** runs that check again
+after a provider outage or quota reset. Provider limits and subtitle availability
+still apply; paid transcription/translation is not invoked.
+
+The preferred language in Playback controls which subtitles are fetched. Files
+with full subtitles in that language are skipped. Matching first uses the exact
+video hash, then the movie/show identity, episode numbers and release name.
+Combined episodes require an exact hash match. Uncertain release matches are
+left without new subtitles rather than silently attaching another cut's timing.
+
+New subtitle files use the video's basename and language suffix (for example
+`Example S01E02.eng.srt`), and are uploaded alongside the video. Existing library
+checks upload just the subtitle file to the matching Drive folder, then refresh
+the library. Video files and existing subtitle files are not overwritten.
+A subtitle provider error never prevents a new video from completing its upload.
+The download history and Settings show subtitle results and quota failures.
+
+Credentials are stored in `data/subtitles/account.json`, with permissions 0600,
+and excluded from Git. API responses and ordinary settings do not expose the
+password or key. Alternatively configure `POPCORN_OPENSUBTITLES_USERNAME`,
+`POPCORN_OPENSUBTITLES_PASSWORD` and `POPCORN_OPENSUBTITLES_API_KEY` in the service
+environment. No OpenSubtitles account is preconfigured by this deployment.

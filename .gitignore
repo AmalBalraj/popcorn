@@ -8,4 +8,12 @@ __pycache__/
 *.zipx
 popcorn-*/
 data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/job-controls/
+data/media-cache/
+data/preview-cache/
+data/tv-migration/
+data/subtitles/
+data/settings.json
 backups/

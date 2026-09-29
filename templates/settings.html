@@ -18,6 +18,7 @@
           <div class="settings-nav-group">Administration</div>
           <a href="#server">Server</a>
           <a href="#library">Library</a>
+          <a href="#subtitles">Subtitle downloads</a>
           <a href="#members">Members</a>
         {% endif %}
       </nav>
@@ -61,6 +62,21 @@
             <p>Where new titles go, and how Popcorn looks for them. These are the defaults new downloads use.</p>
           </header>
           <div class="settings-rows">
+            {% if account.is_admin %}
+            <div class="settings-row">
+              <label class="settings-label" for="subtitle_auto_download">
+                <strong>Download missing subtitles</strong>
+                <small>Find subtitles in your preferred language and save them beside new videos. Requires the account connection below.</small>
+              </label>
+              <div class="settings-control">
+                <label class="switch">
+                  <input type="checkbox" name="subtitle_auto_download" id="subtitle_auto_download" {{ 'checked' if settings.subtitle_auto_download }}>
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span class="switch-text">On</span>
+                </label>
+              </div>
+            </div>
+            {% endif %}
             <div class="settings-row">
               <label class="settings-label" for="default_upload">
                 <strong>Save downloads to</strong>
@@ -73,7 +89,7 @@
             <div class="settings-row">
               <label class="settings-label" for="default_source">
                 <strong>Preferred source</strong>
-                <small>Which index Popcorn searches first. “All sources” is slower but thorough.</small>
+                <small>Favor this source while keeping other sources available.</small>
               </label>
               <div class="settings-control">
                 <select class="select" name="default_source" id="default_source">
@@ -83,13 +99,16 @@
                   ] %}
                     <option value="{{ value }}" {{ 'selected' if settings.default_source == value }}>{{ label }}</option>
                   {% endfor %}
+                  {% if torznab_available %}
+                    <option value="torznab" {{ 'selected' if settings.default_source == 'torznab' }}>Configured index</option>
+                  {% endif %}
                 </select>
               </div>
             </div>
             <div class="settings-row">
               <label class="settings-label" for="search_timeout">
                 <strong>Search timeout</strong>
-                <small>How long to wait for a slow index before giving up.</small>
+                <small>Maximum wait. Available results may appear sooner.</small>
               </label>
               <div class="settings-control">
                 <select class="select" name="search_timeout" id="search_timeout">
@@ -97,19 +116,6 @@
                     <option value="{{ seconds }}" {{ 'selected' if settings.search_timeout == seconds }}>{{ seconds }} seconds</option>
                   {% endfor %}
                 </select>
-              </div>
-            </div>
-            <div class="settings-row">
-              <label class="settings-label" for="private_dns">
-                <strong>Use private DNS</strong>
-                <small>Resolves index sites through Cloudflare. Needed when your network blocks them.</small>
-              </label>
-              <div class="settings-control is-inline">
-                <label class="switch">
-                  <input type="checkbox" name="private_dns" id="private_dns" {{ 'checked' if settings.private_dns }}>
-                  <span class="switch-track"></span>
-                  <span class="switch-text"><strong id="private_dns_label">{{ 'On' if settings.private_dns else 'Off' }}</strong></span>
-                </label>
               </div>
             </div>
           </div>
@@ -261,6 +267,38 @@
       </section>
 
       {% if account.is_admin %}
+      <section class="settings-section" id="subtitles">
+        <header>
+          <h2>Subtitle downloads</h2>
+          <p>Connect OpenSubtitles to fetch release-matched subtitles for movies and TV episodes. Downloads keep working when subtitles are unavailable.</p>
+        </header>
+        <p class="t-dim">Use your <a href="https://www.opensubtitles.com" target="_blank" rel="noopener">OpenSubtitles.com account</a> and create an API key under <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">API consumers</a>. Your account's download quota applies.</p>
+        <form id="subtitle-account-form">
+          <div class="settings-rows">
+            <div class="settings-row">
+              <label class="settings-label" for="opensubtitles_username"><strong>OpenSubtitles username</strong><small>Use your username rather than your email address.</small></label>
+              <div class="settings-control"><input class="input" id="opensubtitles_username" name="username" autocomplete="username" required maxlength="1000"></div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="opensubtitles_password"><strong>OpenSubtitles password</strong></label>
+              <div class="settings-control"><input class="input" id="opensubtitles_password" name="password" type="password" autocomplete="current-password" required maxlength="1000"></div>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="opensubtitles_api_key"><strong>API key</strong><small>Stored privately on the server with your account credentials.</small></label>
+              <div class="settings-control"><input class="input" id="opensubtitles_api_key" name="api_key" type="password" autocomplete="off" required maxlength="1000"></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap;margin-top:var(--s4)">
+            <button class="btn btn-primary" type="submit">Connect and enable</button>
+            <button class="btn btn-outline" id="subtitle-disconnect" type="button" disabled>Disconnect</button>
+            <span class="form-status" id="subtitle-account-status" role="status" aria-live="polite">Checking connection…</span>
+          </div>
+        </form>
+        <div style="display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap;margin-top:var(--s4)">
+          <button class="btn btn-outline btn-sm" id="subtitle-scan" type="button" disabled>Find subtitles for existing videos</button>
+          <span class="form-status" id="subtitle-scan-status" role="status" aria-live="polite"></span>
+        </div>
+      </section>
       <section class="settings-section" id="server">
         <header>
           <h2>Server</h2>

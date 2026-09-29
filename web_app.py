@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import shutil
-import socket
 import subprocess
 import tempfile
 import threading
@@ -15,7 +14,8 @@ import uuid
 import os
 import re
 import signal
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import fcntl
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
@@ -26,6 +26,9 @@ from flask import Flask, jsonify, redirect, render_template, request, send_file,
 from werkzeug.security import check_password_hash
 
 import popcorn
+import media_library
+import subtitle_downloads
+from job_transfer import Transfer, stop_transfer, PROGRESS_PATTERN
 from clips import analysis as clip_analysis
 from clips import pipeline as clip_pipeline
 from clips import render as clip_render
@@ -52,24 +55,21 @@ TMDB_API_KEY = os.environ.get("POPCORN_TMDB_API_KEY", "").strip()
 LIBRARY_PATH = Path(os.environ.get("POPCORN_LIBRARY_PATH", "/home/amal/gdrive-movies"))
 LIBRARY_REMOTE = os.environ.get("POPCORN_LIBRARY_REMOTE", "gdrive:Movies").rstrip("/")
 RCLONE_RC_URL = os.environ.get("POPCORN_RCLONE_RC_URL", "http://127.0.0.1:5572/")
-
-SOURCE_SEARCHERS = {
-    "regional": popcorn.search_bitsearch,
-    "tpb": popcorn.search_apibay,
-    "rarbg": popcorn.search_rarbg,
-    "yts": popcorn.search_yts,
-    "tgx": popcorn.search_tg,
-    "torrents-csv": popcorn.search_torrents_csv,
-}
+SHOWS_PATH = Path(os.environ.get("POPCORN_SHOWS_PATH", "/home/amal/gdrive-shows"))
+SHOWS_REMOTE = os.environ.get("POPCORN_SHOWS_REMOTE", "gdrive:TV Shows").rstrip("/")
+SHOWS_RC_URL = os.environ.get("POPCORN_SHOWS_RC_URL", "http://127.0.0.1:5573/")
 
 SEARCHES: dict[str, dict] = {}
 JOBS: dict[str, dict] = {}
 JOB_PROCESSES: dict[str, subprocess.Popen] = {}
+JOB_WORKERS: set[str] = set()
+JOB_RETRY_BASE = float(os.environ.get("POPCORN_JOB_RETRY_BASE", "30"))
+JOB_RETRY_MAX = float(os.environ.get("POPCORN_JOB_RETRY_MAX", "1800"))
+JOB_MAX_WORKERS = int(os.environ.get("POPCORN_JOB_MAX_WORKERS", "3"))
 STATE_LOCK = threading.Lock()
-SEARCH_LOCK = threading.Lock()
 ROOT = Path(__file__).resolve().parent
 SETTINGS_FILE = ROOT / "data" / "settings.json"
-STATE_FILE = ROOT / "data" / "popcorn.sqlite3"
+STATE_FILE = Path(os.environ.get("POPCORN_STATE_FILE", str(ROOT / "data" / "popcorn.sqlite3")))
 DEFAULT_SETTINGS = {
     "default_upload": DEFAULT_UPLOAD_TO,
     "default_source": "all",
@@ -77,6 +77,7 @@ DEFAULT_SETTINGS = {
     "search_timeout": 15,
     "subtitle_language": "eng",
     "subtitle_mode": "Always",
+    "subtitle_auto_download": True,
     "clip_target_count": clip_pipeline.DEFAULT_SETTINGS["clip_target_count"],
     "clip_min_seconds": clip_pipeline.DEFAULT_SETTINGS["clip_min_seconds"],
     "clip_max_seconds": clip_pipeline.DEFAULT_SETTINGS["clip_max_seconds"],
@@ -86,7 +87,7 @@ DEFAULT_SETTINGS = {
 }
 
 TERMINAL_JOB_STATES = {"complete", "failed", "interrupted", "cancelled"}
-ACTIVE_JOB_STATES = {"queued", "resolving", "downloading", "uploading", "indexing", "cancelling"}
+ACTIVE_JOB_STATES = {"queued", "resolving", "downloading", "identifying", "subtitles", "uploading", "indexing", "cancelling"}
 # Clip jobs share the jobs table and the Stop plumbing, but their stages are
 # their own: nothing about a clip job looks like a download.
 CLIP_ACTIVE_STATES = {
@@ -134,7 +135,7 @@ def _init_state() -> None:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
-        rows = connection.execute("SELECT payload FROM jobs ORDER BY created_at DESC LIMIT 200").fetchall()
+        rows = connection.execute("SELECT payload FROM jobs ORDER BY created_at DESC").fetchall()
     clip_store.bind(STATE_FILE)
     clip_store.ensure_schema()
     for (payload,) in rows:
@@ -153,17 +154,20 @@ def _init_state() -> None:
                         "updated_at": time.time(),
                     })
                 else:
-                    partial_dir = saved.get("download_dir")
-                    if partial_dir:
-                        partial_path = Path(partial_dir).resolve()
-                        if partial_path.parent == ROOT and partial_path.name.startswith("popcorn-web-"):
-                            shutil.rmtree(partial_path, ignore_errors=True)
-                    saved.update({
-                        "status": "interrupted",
-                        "message": "The server restarted before this download finished. Partial local files were removed.",
-                        "download_dir": None,
-                        "updated_at": time.time(),
-                    })
+                    # New jobs persist stage checkpoints and selected release.
+                    # Older rows retain their local files even when they cannot resume.
+                    if saved.get("status") in {"uploading", "indexing"}:
+                        saved["download_complete"] = True
+                    if saved.get("status") == "indexing":
+                        saved["upload_complete"] = True
+                    if saved.get("status") == "needs_identification":
+                        saved.update(retry_at=None, recoverable=False)
+                    elif saved.get("release") or saved.get("download_complete"):
+                        saved.update(retry_at=0, message="Recovering saved download…")
+                    else:
+                        saved.update(status="interrupted",
+                                     message="This older job lacks recovery metadata. Local files were retained.")
+                    saved["updated_at"] = time.time()
                 _persist_job(saved)
             elif saved.get("speed") != "—" or saved.get("eta") != "—":
                 saved.update({"speed": "—", "eta": "—"})
@@ -182,7 +186,7 @@ def _remove_clip_work_dir(work_dir: str | None) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _persist_job(job: dict) -> None:
+def _persist_job(job: dict, *, required: bool = False) -> None:
     """Save a job to disk without ever letting that save break the job.
 
     The running server keeps job state in memory and every page reads it from
@@ -202,6 +206,8 @@ def _persist_job(job: dict) -> None:
         except sqlite3.Error as exc:
             if attempt == 2:
                 app.logger.error("Could not save job %s: %s", job.get("id"), exc)
+                if required:
+                    raise
                 return
             time.sleep(0.5 * (attempt + 1))
 
@@ -224,7 +230,6 @@ def _set_meta_timestamp(key: str) -> None:
         )
 
 
-_init_state()
 
 
 def _error(message: str, status: int = 400, detail: str | None = None):
@@ -419,6 +424,9 @@ def _public_result(result: popcorn.TorrentResult, index: int) -> dict:
         "peers": result.peers,
         "size": result.size,
         "source": result.source,
+        "sources": result.sources,
+        "score": result.score,
+        "score_details": result.score_details,
     }
 
 
@@ -529,7 +537,8 @@ def watch():
 @login_required
 def settings_page():
     account = _refresh_account_session()
-    return render_template("settings.html", settings=_load_settings(), account=account)
+    return render_template("settings.html", settings=_load_settings(), account=account,
+                           torznab_available="torznab" in popcorn.source_service.providers)
 
 
 @app.route("/api/settings", methods=["GET", "PUT"])
@@ -539,8 +548,11 @@ def settings_api():
         return jsonify(_load_settings())
     payload = request.get_json(silent=True) or {}
     settings = _load_settings()
+    if "subtitle_auto_download" in payload and payload["subtitle_auto_download"] != settings["subtitle_auto_download"]:
+        if not (_refresh_account_session() or {}).get("is_admin"):
+            return _error("Administrator access is required to change automatic subtitle downloads.", 403)
     source = str(payload.get("default_source", settings["default_source"]))
-    if source not in (*SOURCE_SEARCHERS, "all"):
+    if source not in (*popcorn.source_service.providers, "all"):
         return _error("Unknown search source.")
     try:
         timeout = max(5, min(int(payload.get("search_timeout", settings["search_timeout"])), 60))
@@ -569,6 +581,7 @@ def settings_api():
         "search_timeout": timeout,
         "subtitle_language": subtitle_language,
         "subtitle_mode": subtitle_mode,
+        "subtitle_auto_download": bool(payload.get("subtitle_auto_download", settings["subtitle_auto_download"])),
         "clip_target_count": clip_target_count,
         "clip_min_seconds": clip_min_seconds,
         "clip_max_seconds": clip_max_seconds,
@@ -584,6 +597,159 @@ def settings_api():
     except requests.RequestException:
         return jsonify({"settings": settings, "warning": "Saved in Popcorn, but Jellyfin could not be updated."})
     return jsonify({"settings": settings})
+
+
+@app.route("/api/subtitles/account", methods=["GET", "POST", "DELETE"])
+@admin_required
+def subtitle_account():
+    if request.method == "GET":
+        response = jsonify({**subtitle_downloads.provider_status(ROOT), "scan": _subtitle_scan_status()})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    if request.method == "DELETE":
+        (ROOT / "data/subtitles/account.json").unlink(missing_ok=True)
+        return jsonify(subtitle_downloads.provider_status(ROOT))
+    payload = request.get_json(silent=True) or {}
+    credentials = {name: str(payload.get(name, "")) for name in ("username", "password", "api_key")}
+    credentials["username"] = credentials["username"].strip()
+    credentials["api_key"] = credentials["api_key"].strip()
+    if not subtitle_downloads.configured(credentials) or any(len(value) > 1000 for value in credentials.values()):
+        return _error("Enter your OpenSubtitles username, password, and API key.")
+    try:
+        subtitle_downloads.OpenSubtitles(credentials).login()
+    except subtitle_downloads.SubtitleError as exc:
+        return _error(str(exc), 400 if exc.status == "authentication_required" else 502)
+    subtitle_downloads.atomic_json(ROOT / "data/subtitles/account.json", credentials)
+    settings = _load_settings()
+    settings["subtitle_auto_download"] = True
+    _save_settings(settings)
+    _start_subtitle_scan()
+    return jsonify({**subtitle_downloads.provider_status(ROOT),
+                    "scan": _subtitle_scan_status(),
+                    "message": "Connected. Automatic downloads are on; checking existing videos for missing subtitles."})
+
+
+SUBTITLE_SCAN_LOCK = threading.Lock()
+SUBTITLE_SCAN_ACTIVE = False
+
+
+def _subtitle_scan_status():
+    try:
+        result = json.loads((ROOT / "data/subtitles/scan.json").read_text())
+    except (OSError, ValueError):
+        return {"status": "idle"}
+    if result.get("status") == "running" and not SUBTITLE_SCAN_ACTIVE:
+        return {**result, "status": "interrupted", "message": "The server restarted. Run the subtitle check again."}
+    return result
+
+
+def _scan_library_subtitles():
+    status_file = ROOT / "data/subtitles/scan.json"
+    state = {"status": "running", "checked": 0, "total": 0, "downloaded": 0, "existing": 0, "no_match": 0}
+    subtitle_downloads.atomic_json(status_file, state)
+    language = _load_settings()["subtitle_language"]
+    token = _server_jellyfin_token()
+    try:
+        response = requests.get(f"{JELLYFIN_URL}/Items", headers=_jellyfin_headers(token, ""),
+            params={"Recursive": "true", "IncludeItemTypes": "Movie,Episode", "Limit": 10000,
+                    "Fields": "Path,ProviderIds,MediaSources,MediaStreams,RunTimeTicks,SeriesId,ProductionYear"}, timeout=30)
+        response.raise_for_status()
+        items = response.json().get("Items", [])
+        credentials = subtitle_downloads.load_credentials(ROOT)
+        client = subtitle_downloads.OpenSubtitles(credentials)
+        series = {}
+        try:
+            manifest = json.loads((ROOT / "data/tv-migration/manifest.json").read_text())
+            original_releases = {str(SHOWS_PATH / e["relative"]): Path(e["source_remote"]).stem
+                                 for e in manifest.get("entries", []) if not e.get("sidecar")}
+        except (OSError, ValueError):
+            original_releases = {}
+        sources = [(item, source) for item in items for source in item.get("MediaSources", [])]
+        state["total"] = len(sources)
+        with tempfile.TemporaryDirectory(prefix="subtitles-", dir=ROOT / "data/subtitles") as work:
+            for item, source in sources:
+                state["checked"] += 1
+                state["current_title"] = item.get("SeriesName") or item.get("Name", "")
+                subtitle_downloads.atomic_json(status_file, state)
+                path = Path(source.get("Path", ""))
+                destination = None
+                for library_path, remote in ((LIBRARY_PATH, LIBRARY_REMOTE), (SHOWS_PATH, SHOWS_REMOTE)):
+                    if path.is_absolute() and path.is_relative_to(library_path) and ".." not in path.parts:
+                        destination = remote + "/" + str(path.relative_to(library_path).with_suffix(f".{language}.srt"))
+                        break
+                if not destination or path.suffix.lower() not in VIDEO_EXTENSIONS or not path.is_file():
+                    continue
+                providers = item.get("ProviderIds", {})
+                identity = {"kind": "movie", "title": item["Name"], "year": item.get("ProductionYear"),
+                            "tmdb_id": providers.get("Tmdb"), "imdb_id": providers.get("Imdb"),
+                            "duration": (source.get("RunTimeTicks") or item.get("RunTimeTicks") or 0) / TICKS_PER_SECOND}
+                if item["Type"] == "Episode":
+                    sid = item.get("SeriesId")
+                    if not sid:
+                        continue
+                    if sid not in series:
+                        series[sid] = _server_library_item(sid, "ProviderIds,Name") or {}
+                    show = series[sid]
+                    coord = media_library.coordinates(path.name)
+                    if item.get("ParentIndexNumber") is None or item.get("IndexNumber") is None:
+                        continue
+                    identity.update(kind="episode", title=show.get("Name", item.get("SeriesName", "")),
+                        show_tmdb_id=show.get("ProviderIds", {}).get("Tmdb"),
+                        season=item["ParentIndexNumber"], episode=item["IndexNumber"], end_episode=coord[2] if coord else None)
+                release = original_releases.get(str(path), path.stem)
+                result = subtitle_downloads.fetch_one(client, path, identity, release, language,
+                    source.get("MediaStreams") or item.get("MediaStreams") or [], output_dir=work)
+                if result["status"] == "downloaded":
+                    subprocess.run(["rclone", "copyto", result["path"], destination, "--immutable",
+                        "--retries=2", "--contimeout=10s", "--timeout=30s"], check=True, timeout=90,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    Path(result["path"]).unlink()
+                state[result["status"]] = state.get(result["status"], 0) + 1
+            state["status"] = "complete"
+    except subtitle_downloads.SubtitleError as exc:
+        state.update(status=exc.status, message=str(exc))
+    except (requests.RequestException, subprocess.SubprocessError, OSError, ValueError, TypeError, KeyError):
+        state.update(status="unavailable", message="The subtitle check stopped temporarily. Run it again to continue.")
+    finally:
+        if state["downloaded"]:
+            _refresh_library_mount()
+            _refresh_library()
+        state.pop("current_title", None)
+        subtitle_downloads.atomic_json(status_file, state)
+
+
+def _start_subtitle_scan():
+    global SUBTITLE_SCAN_ACTIVE
+    if not SUBTITLE_SCAN_LOCK.acquire(blocking=False):
+        return False
+    SUBTITLE_SCAN_ACTIVE = True
+    try:
+        subtitle_downloads.atomic_json(ROOT / "data/subtitles/scan.json",
+            {"status": "running", "checked": 0, "total": 0, "downloaded": 0})
+    except OSError:
+        SUBTITLE_SCAN_ACTIVE = False
+        SUBTITLE_SCAN_LOCK.release()
+        raise
+    def run():
+        global SUBTITLE_SCAN_ACTIVE
+        try:
+            _scan_library_subtitles()
+        finally:
+            SUBTITLE_SCAN_ACTIVE = False
+            SUBTITLE_SCAN_LOCK.release()
+    threading.Thread(target=run, daemon=True, name="subtitle-library-check").start()
+    return True
+
+
+@app.post("/api/subtitles/scan")
+@admin_required
+def subtitle_scan():
+    if not subtitle_downloads.provider_status(ROOT)["connected"]:
+        return _error("Connect OpenSubtitles first.")
+    if not _server_jellyfin_token():
+        return _error("The media library is not connected.", 503)
+    started = _start_subtitle_scan()
+    return jsonify({"started": started, "scan": _subtitle_scan_status()}), 202
 
 
 def _jellyfin_request(method: str, path: str, **kwargs) -> requests.Response:
@@ -602,16 +768,14 @@ def _jellyfin_request(method: str, path: str, **kwargs) -> requests.Response:
 
 def _refresh_library_mount() -> None:
     """Best-effort refresh of the read-only rclone mount's directory cache."""
-    try:
-        subprocess.run(
-            ["rclone", "rc", "vfs/refresh", "recursive=true", "--url", RCLONE_RC_URL],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        pass
+    for rc_url in (RCLONE_RC_URL, SHOWS_RC_URL):
+        try:
+            subprocess.run(
+                ["rclone", "rc", "vfs/refresh", "recursive=true", "--url", rc_url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            pass
 
 
 @app.get("/api/account")
@@ -731,21 +895,7 @@ def clear_watch_history():
 
 
 def _tmdb_get(path: str, **params) -> dict:
-    if not TMDB_API_KEY:
-        raise RuntimeError("TMDB is not configured.")
-    headers = {"Accept": "application/json"}
-    if TMDB_API_KEY.startswith("eyJ"):
-        headers["Authorization"] = f"Bearer {TMDB_API_KEY}"
-    else:
-        params["api_key"] = TMDB_API_KEY
-    response = requests.get(
-        f"https://api.themoviedb.org/3/{path.lstrip('/')}",
-        headers=headers,
-        params=params,
-        timeout=12,
-    )
-    response.raise_for_status()
-    return response.json()
+    return media_library.tmdb_get(TMDB_API_KEY, path, ROOT / "data" / "media-cache", **params)
 
 
 def _clean_movie_title(title: str) -> tuple[str, int | None]:
@@ -778,6 +928,40 @@ def _search_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
+TITLE_ALIASES: dict[str, tuple[float, list[str]]] = {}
+TITLE_ALIAS_INFLIGHT: set[str] = set()
+
+
+def _title_aliases(query):
+    """TMDB enrichment runs off the source-search latency path."""
+    key = _search_key(query)
+    with STATE_LOCK:
+        cached = TITLE_ALIASES.get(key)
+        if cached and time.time() - cached[0] < 1800:
+            return list(cached[1])
+        if not TMDB_API_KEY or key in TITLE_ALIAS_INFLIGHT or len(TITLE_ALIAS_INFLIGHT) >= 2:
+            return list(cached[1]) if cached else []
+        TITLE_ALIAS_INFLIGHT.add(key)
+    def enrich():
+        aliases = []
+        try:
+            for movie in _tmdb_get("search/movie", query=query, include_adult="false").get("results", [])[:3]:
+                if _result_matches(movie.get("title", ""), query):
+                    for name in (movie.get("title"), movie.get("original_title")):
+                        if name:
+                            aliases.append(f"{name} {str(movie.get('release_date', ''))[:4]}".strip())
+        except (requests.RequestException, RuntimeError, ValueError):
+            pass
+        finally:
+            with STATE_LOCK:
+                if len(TITLE_ALIASES) >= 256:
+                    TITLE_ALIASES.pop(next(iter(TITLE_ALIASES)))
+                TITLE_ALIASES[key] = (time.time(), list(dict.fromkeys(aliases)))
+                TITLE_ALIAS_INFLIGHT.discard(key)
+    threading.Thread(target=enrich, daemon=True, name="title-aliases").start()
+    return list(cached[1]) if cached else []
+
+
 def _regional_search_queries(query: str) -> list[str]:
     """Expand local-language titles without requiring one exact spelling."""
     candidates = [query, *SEARCH_ALIASES.get(_search_key(query), [])]
@@ -794,22 +978,7 @@ def _regional_search_queries(query: str) -> list[str]:
         if old in words:
             candidates.append(" ".join(new if word == old else word for word in words))
 
-    if TMDB_API_KEY:
-        try:
-            movies = _tmdb_get(
-                "search/movie", query=query, include_adult="false"
-            ).get("results", [])[:3]
-            query_tokens = set(key.split())
-            for movie in movies:
-                for name in (movie.get("title"), movie.get("original_title")):
-                    if not name:
-                        continue
-                    name_tokens = set(_search_key(name).split())
-                    if query_tokens and len(query_tokens & name_tokens) / len(query_tokens) >= 0.5:
-                        year = str(movie.get("release_date", ""))[:4]
-                        candidates.append(f"{name} {year}".strip())
-        except (requests.RequestException, RuntimeError, ValueError):
-            pass
+    candidates.extend(_title_aliases(query))
 
     unique: list[str] = []
     seen: set[str] = set()
@@ -821,9 +990,6 @@ def _regional_search_queries(query: str) -> list[str]:
     return unique[:8]
 
 
-def _result_identity(result: popcorn.TorrentResult) -> str:
-    match = re.search(r"urn:btih:([A-Fa-f0-9]{40})", result.magnet or "")
-    return match.group(1).lower() if match else _search_key(result.title)
 
 
 def _result_matches(title: str, query: str) -> bool:
@@ -839,66 +1005,6 @@ def _result_matches(title: str, query: str) -> bool:
     return len(query_tokens & title_tokens) >= required
 
 
-# ── Release parsing ─────────────────────────────────────────────────────────
-#
-# Torrent titles are written for indexers, not people. Parsing the useful
-# facts out of them is what lets search present "Inception — 1080p BluRay"
-# instead of a wall of scene names.
-
-_RESOLUTION_TAGS = [
-    (re.compile(r"\b(2160p|4k|uhd)\b", re.I), "4K"),
-    (re.compile(r"\b1440p\b", re.I), "1440p"),
-    (re.compile(r"\b1080p\b", re.I), "1080p"),
-    (re.compile(r"\b720p\b", re.I), "720p"),
-    (re.compile(r"\b(480p|576p|sd)\b", re.I), "480p"),
-]
-_SOURCE_TAGS = [
-    (re.compile(r"\bremux\b", re.I), "Remux"),
-    (re.compile(r"\b(blu-?ray|bdrip|brrip|bdremux)\b", re.I), "BluRay"),
-    (re.compile(r"\b(web-?dl|webdl|web)\b", re.I), "WEB-DL"),
-    (re.compile(r"\bweb-?rip\b", re.I), "WEBRip"),
-    (re.compile(r"\b(hdrip|hdtv)\b", re.I), "HDRip"),
-    (re.compile(r"\b(dvdrip|dvdscr|dvd)\b", re.I), "DVDRip"),
-    (re.compile(r"\b(telesync|telesynch|hdts|ts)\b", re.I), "TeleSync"),
-    (re.compile(r"\b(hdcam|cam|predvd)\b", re.I), "CAM"),
-]
-_CODEC_TAGS = [
-    (re.compile(r"\b(x265|h\.?265|hevc)\b", re.I), "HEVC"),
-    (re.compile(r"\b(x264|h\.?264|avc)\b", re.I), "H.264"),
-    (re.compile(r"\bav1\b", re.I), "AV1"),
-    (re.compile(r"\bxvid|divx\b", re.I), "XviD"),
-]
-_AUDIO_TAGS = [
-    (re.compile(r"\b(atmos|truehd)\b", re.I), "Atmos"),
-    (re.compile(r"\bdts(-hd)?\b", re.I), "DTS"),
-    (re.compile(r"\b(ddp|eac3|dd\+)\s?5\.?1\b|\bddp5\b", re.I), "DD+ 5.1"),
-    (re.compile(r"\bac3\b|\bdd\s?5\.?1\b", re.I), "DD 5.1"),
-    (re.compile(r"\baac\s?5\.?1\b", re.I), "AAC 5.1"),
-    (re.compile(r"\baac\b", re.I), "AAC"),
-]
-_SEASON_PACK = re.compile(r"\b(?:s\d{1,2}\s*(?:complete|full)|season\s*\d{1,2}|complete\s*series)\b", re.I)
-_EPISODE_TAG = re.compile(r"\bS(\d{1,2})\s?E(\d{1,3})\b", re.I)
-
-
-def _first_tag(tags: list[tuple[re.Pattern, str]], text: str) -> str | None:
-    for pattern, label in tags:
-        if pattern.search(text):
-            return label
-    return None
-
-
-def _release_info(title: str) -> dict:
-    """The facts a person actually chooses between."""
-    episode = _EPISODE_TAG.search(title)
-    return {
-        "resolution": _first_tag(_RESOLUTION_TAGS, title),
-        "source": _first_tag(_SOURCE_TAGS, title),
-        "codec": _first_tag(_CODEC_TAGS, title),
-        "audio": _first_tag(_AUDIO_TAGS, title),
-        "season_pack": bool(_SEASON_PACK.search(title)),
-        "season": int(episode.group(1)) if episode else None,
-        "episode": int(episode.group(2)) if episode else None,
-    }
 
 
 # General indexes happily return software, music and worse for a film query.
@@ -926,15 +1032,12 @@ MIN_FILM_BYTES = 80 * 1024 * 1024
 def _looks_like_video(result: popcorn.TorrentResult) -> bool:
     if _NOT_VIDEO.search(result.title):
         return False
-    size = _parse_size_bytes(result.size)
+    size = result.size_bytes or _parse_size_bytes(result.size)
     if size and size < MIN_FILM_BYTES:
         return False
     return True
 
 
-_RESOLUTION_RANK = {"4K": 5, "1440p": 4, "1080p": 3, "720p": 2, "480p": 1, None: 0}
-_SOURCE_RANK = {"Remux": 6, "BluRay": 5, "WEB-DL": 4, "WEBRip": 3, "HDRip": 2, "DVDRip": 1,
-                "TeleSync": -1, "CAM": -2, None: 0}
 
 
 def _group_releases(results: list[popcorn.TorrentResult], query: str) -> list[dict]:
@@ -943,15 +1046,21 @@ def _group_releases(results: list[popcorn.TorrentResult], query: str) -> list[di
     for index, result in enumerate(results):
         cleaned, year = _clean_movie_title(result.title)
         key = f"{_search_key(cleaned)}|{year or ''}"
-        info = _release_info(result.title)
+        info = {"resolution": result.resolution, "source": result.source_type,
+                "codec": result.codec, "audio": result.audio, "hdr": result.hdr,
+                "language": result.language, "release_group": result.release_group,
+                "season_pack": result.season_pack, "season": result.season,
+                "episode": result.episode, "media_type": result.media_type}
         release = {
             "id": index,
             "title": result.title,
             "size": result.size,
-            "size_bytes": _parse_size_bytes(result.size),
+            "size_bytes": result.size_bytes or _parse_size_bytes(result.size),
             "seeds": result.seeds,
             "peers": result.peers,
             "source": result.source,
+            "sources": result.sources,
+            "score": result.score,
             **info,
         }
         group = groups.get(key)
@@ -969,14 +1078,10 @@ def _group_releases(results: list[popcorn.TorrentResult], query: str) -> list[di
     for group in groups.values():
         releases = sorted(
             group["releases"],
-            key=lambda item: (
-                _RESOLUTION_RANK.get(item["resolution"], 0),
-                _SOURCE_RANK.get(item["source"], 0),
-                item["seeds"],
-            ),
+            key=lambda item: item["score"],
             reverse=True,
         )
-        best = max(releases, key=lambda item: item["seeds"])
+        best = releases[0]
         qualities = []
         for release in releases:
             if release["resolution"] and release["resolution"] not in qualities:
@@ -990,14 +1095,14 @@ def _group_releases(results: list[popcorn.TorrentResult], query: str) -> list[di
             "size": releases[0]["size"],
             "size_bytes": releases[0]["size_bytes"],
             "best_id": best["id"],
+            "best_score": best["score"],
         })
 
-    # Titles whose name actually reflects the query come first; then the
-    # healthiest swarms, which is what makes a download succeed.
+    # Use the same identity-aware score for title groups and release selection.
     query_key = _search_key(query)
     ordered.sort(key=lambda group: (
         0 if query_key and query_key in _search_key(group["title"]) else 1,
-        -group["top_seeds"],
+        -group["best_score"],
     ))
     return ordered
 
@@ -1198,15 +1303,12 @@ def search():
     query = str(payload.get("query", "")).strip()
     settings = _load_settings()
     source = str(payload.get("source", settings["default_source"]))
-    use_doh = bool(payload.get("doh", settings["private_dns"])) or source in {
-        "yts", "all"
-    }
 
     if len(query) < 2:
         return _error("Enter at least two characters to search.")
     if len(query) > 120:
         return _error("Search query is too long.")
-    if source not in (*SOURCE_SEARCHERS, "all"):
+    if source not in (*popcorn.source_service.providers, "all"):
         return _error("Unknown search source.")
 
     try:
@@ -1214,64 +1316,32 @@ def search():
     except (TypeError, ValueError):
         return _error("Timeout must be a number between 5 and 60.")
 
-    # grabber's networking configuration is module-global, so searches are
-    # serialized and restored after each request.
-    with SEARCH_LOCK:
-        old_timeout = popcorn._TIMEOUT
-        old_resolver = socket.getaddrinfo
-        popcorn._TIMEOUT = timeout
-        if use_doh:
-            socket.getaddrinfo = popcorn._doh_getaddrinfo
-        try:
-            names = list(SOURCE_SEARCHERS) if source == "all" else [source]
-            results = []
-            source_status = {}
-
-            def run_source(name: str) -> tuple[str, list[popcorn.TorrentResult], float, str | None]:
-                started = time.monotonic()
-                try:
-                    queries = _regional_search_queries(query) if name == "regional" else [query]
-                    found = []
-                    seen = set()
-                    for expanded_query in queries:
-                        for item in SOURCE_SEARCHERS[name](expanded_query):
-                            if name == "regional" and not _result_matches(item.title, expanded_query):
-                                continue
-                            identity = _result_identity(item)
-                            if identity not in seen:
-                                seen.add(identity)
-                                found.append(item)
-                        if name == "regional" and len(found) >= 5:
-                            break
-                    return name, found, time.monotonic() - started, None
-                except Exception as exc:
-                    return name, [], time.monotonic() - started, str(exc)
-
-            with ThreadPoolExecutor(max_workers=len(names)) as executor:
-                futures = [executor.submit(run_source, name) for name in names]
-                for future in as_completed(futures):
-                    name, found, elapsed, source_error = future.result()
-                    results.extend(found)
-                    source_status[name] = {
-                        "count": len(found),
-                        "elapsed": round(elapsed, 2),
-                        "available": bool(found),
-                        "error": source_error,
-                    }
-        finally:
-            popcorn._TIMEOUT = old_timeout
-            socket.getaddrinfo = old_resolver
-
-    deduplicated = {}
-    for item in results:
-        if not _looks_like_video(item):
-            continue
-        identity = _result_identity(item)
-        existing = deduplicated.get(identity)
-        if not existing or item.seeds > existing.seeds:
-            deduplicated[identity] = item
-    results = sorted(deduplicated.values(), key=lambda item: item.seeds, reverse=True)
-    search_id = uuid.uuid4().hex
+    cleaned, detected_year = _clean_movie_title(query)
+    try:
+        context = popcorn.SearchContext(
+            title=cleaned or query,
+            year=int(payload["year"]) if payload.get("year") else detected_year,
+            media_type=payload.get("media_type"),
+            season=int(payload["season"]) if payload.get("season") is not None else None,
+            episode=int(payload["episode"]) if payload.get("episode") is not None else None,
+            resolution=payload.get("resolution"), language=payload.get("language"),
+            codec=payload.get("codec"),
+            aliases=tuple(_regional_search_queries(query)[1:3]),
+        )
+    except (TypeError, ValueError):
+        return _error("Year, season and episode must be numbers.")
+    if context.season is None:
+        hints = popcorn.TorrentResult(query)
+        if hints.season is not None:
+            from dataclasses import replace
+            context = replace(context, title=re.sub(r"\b(?:S\d{1,2}(?:\s?E\d{1,3})?|Season\s*\d{1,2})\b.*", "", query, flags=re.I).strip(),
+                              media_type=hints.media_type, season=hints.season, episode=hints.episode)
+    names = list(popcorn.source_service.providers) if source == "all" or "source" not in payload else [source]
+    outcome = popcorn.source_service.search(context, names, deadline_seconds=timeout,
+                                            preferred=source if source != "all" else None)
+    results = [item for item in outcome.releases if _looks_like_video(item)]
+    source_status = outcome.providers
+    search_id = outcome.search_id
     with STATE_LOCK:
         _prune_searches()
         SEARCHES[search_id] = {
@@ -1284,6 +1354,8 @@ def search():
         "search_id": search_id,
         "query": query,
         "count": len(results),
+        "stale": outcome.stale,
+        "cache_hit": outcome.cache_hit,
         "sources": source_status,
         "results": [_public_result(item, i) for i, item in enumerate(results)],
         "titles": _group_releases(results, query),
@@ -1326,12 +1398,25 @@ def search_art():
     return jsonify({"poster": _TITLE_POSTER_CACHE[key]})
 
 
+@app.get("/api/admin/providers")
+@admin_required
+def provider_diagnostics():
+    return jsonify({"providers": popcorn.source_service.diagnostics()})
+
+
 def _set_job(job_id: str, **changes) -> None:
     with STATE_LOCK:
+        previous = JOBS[job_id].copy()
         JOBS[job_id].update(changes)
         JOBS[job_id]["updated_at"] = time.time()
         snapshot = JOBS[job_id].copy()
-    _persist_job(snapshot)
+        try:
+            _persist_job(snapshot, required=True)
+        except sqlite3.Error:
+            # A stage checkpoint cannot be visible until it is durable.
+            JOBS[job_id].clear()
+            JOBS[job_id].update(previous)
+            raise
 
 
 def _update_job(job_id: str, *, persist: bool = True, **changes) -> None:
@@ -1374,7 +1459,10 @@ def _register_job_process(job_id: str, process: subprocess.Popen) -> None:
         cancel_now = bool(JOBS.get(job_id, {}).get("cancel_requested"))
     if cancel_now and process.poll() is None:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            if isinstance(process, Transfer):
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
 
@@ -1429,8 +1517,8 @@ def _find_library_item(
             headers=_jellyfin_headers(token, ""),
             params={
                 "Recursive": "true",
-                "IncludeItemTypes": "Movie",
-                "Fields": "Path",
+                "IncludeItemTypes": "Movie,Episode,Series",
+                "Fields": "Path,SeriesId",
                 "Limit": 10000,
             },
             timeout=15,
@@ -1443,7 +1531,7 @@ def _find_library_item(
     expected_paths = {str(Path(path)) for path in media_paths}
     for movie in movies:
         if str(Path(movie.get("Path", ""))) in expected_paths:
-            return movie.get("Id")
+            return movie.get("SeriesId") or movie.get("Id")
 
     # Older jobs do not have captured file paths. Use a conservative title
     # fallback so their history links can still become direct links.
@@ -1505,191 +1593,320 @@ def _trigger_trickplay(token: str | None = None, force: bool = False) -> tuple[b
         return False, "Could not start preview-frame generation."
 
 
+def _job_control(job_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        raise ValueError("Invalid job ID")
+    path = ROOT / "data" / "job-controls" / job_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _owned_download_dir(value) -> Path | None:
+    if not value:
+        return None
+    path = Path(value).resolve()
+    if path.parent != ROOT or not path.name.startswith("popcorn-web-"):
+        raise RuntimeError("The saved download directory is outside Popcorn's workspace.")
+    return path
+
+
+
+def _prepare_tv_import(job_id, result, download_dir):
+    saved = JOBS[job_id]
+    videos = [p for p in download_dir.rglob("*") if p.is_file()
+              and p.suffix.lower() in VIDEO_EXTENSIONS and not re.search(r"\bsample\b", p.stem, re.I)]
+    tv = saved.get("media_kind") == "tv" or result.media_type in {"tv", "episode", "season"} or media_library.looks_like_tv(result.title, videos)
+    if not tv:
+        return None
+    if saved.get("media_kind") == "movie":
+        raise media_library.IdentificationRequired("These files contain TV episode numbers. Choose their show before importing.")
+    _set_job(job_id, status="identifying", message="Matching the show and organizing its episodes…", media_kind="tv")
+    show = saved.get("show_metadata") or media_library.resolve_show(
+        saved.get("show_query") or result.title, _tmdb_get, saved.get("show_tmdb_id"))
+    _set_job(job_id, show_metadata=show, show_tmdb_id=show["id"])
+    seasons = {}
+    for season in show.get("seasons", []):
+        number = season["season_number"]
+        # Fetch only seasons represented by the files, plus specials when present.
+        found = [media_library.coordinates(str(p), saved.get("tv_season")) for p in videos]
+        wanted = {c[0] for c in found if c}
+        wanted.update(c[0] for c in saved.get("episode_overrides", {}).values())
+        if saved.get("tv_season") is not None:
+            wanted.add(saved["tv_season"])
+        if result.season is not None:
+            wanted.add(result.season)
+        if any(media_library.SPECIAL.search(p.stem.replace("_", " ")) for p in videos):
+            wanted.add(0)
+        if not wanted:
+            wanted.add(saved.get("tv_season") or result.season or 1)
+        if number in wanted:
+            seasons[number] = _tmdb_get(f"tv/{show['id']}/season/{number}")
+    overrides = dict(saved.get("episode_overrides", {}))
+    if saved.get("tv_season") is not None:
+        for path in videos:
+            coord = media_library.coordinates(str(path), saved["tv_season"])
+            if coord:
+                overrides.setdefault(path.name, list(coord))
+    version = " ".join(filter(None, [result.resolution, result.codec, (result.infohash or job_id)[:12]]))
+    plan = media_library.episode_plan(videos, result.title, show, seasons, version, overrides)
+    stage = _job_control(job_id) / "library-stage"
+    folder = media_library.stage_tv(download_dir, stage, plan, show)
+    # Local images ensure the read-only library mount does not depend on Jellyfin's DNS route.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(media_library.save_artwork, target, url, ROOT / "data" / "media-cache")
+                   for target, url in media_library.artwork_tasks(folder, plan, show)]
+        for future in futures:
+            future.result()
+    _set_job(job_id, destination=SHOWS_REMOTE, media_kind="tv", display_title=show["name"],
+             import_plan=plan, media_paths=[str(SHOWS_PATH / e["relative"]) for e in plan])
+    return stage
+
+
+def _fetch_download_subtitles(job_id, result, upload_source):
+    settings = _load_settings()
+    saved = JOBS[job_id]
+    language = settings["subtitle_language"]
+    if saved.get("subtitles_checked_language") == language:
+        return
+    if not settings["subtitle_auto_download"]:
+        _set_job(job_id, subtitles_summary={"status": "disabled"})
+        return
+    if not subtitle_downloads.provider_status(ROOT)["connected"]:
+        _set_job(job_id, subtitles_summary={"status": "not_configured"})
+        return
+    _set_job(job_id, status="subtitles", message="Looking for subtitles that match your video…")
+    plan = {e["relative"]: e for e in saved.get("import_plan", [])}
+    files = []
+    for path in upload_source.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS or re.search(r"\bsample\b", path.stem, re.I):
+            continue
+        entry = plan.get(str(path.relative_to(upload_source)))
+        if entry:
+            identity = {"kind": "episode", "title": saved["show_metadata"]["name"],
+                        "show_tmdb_id": saved["show_tmdb_id"], "season": entry["season"],
+                        "episode": entry["episode"], "end_episode": entry.get("end_episode")}
+            release = Path(entry["source"]).stem
+        else:
+            title, year = _clean_movie_title(result.title)
+            identity = {"kind": "movie", "title": title, "year": year or result.year}
+            release = path.stem if len(path.stem) > len(title) else result.title
+        files.append({"path": path, "identity": identity, "release": release})
+    def check_cancelled():
+        if _job_cancel_requested(job_id):
+            raise DownloadCancelled()
+    summary = subtitle_downloads.fetch_batch(ROOT, files, language, check_cancelled,
+        lambda index, total: _set_job(job_id, message=f"Finding subtitles for video {index} of {total}…"))
+    summary.pop("files", None)
+    fields = {"subtitles_summary": summary}
+    if summary["status"] == "complete":
+        fields["subtitles_checked_language"] = language
+    _set_job(job_id, **fields)
+
+
 def _run_download(
     job_id: str, result: popcorn.TorrentResult, upload_to: str, jellyfin_token: str | None
 ) -> None:
-    download_dir: str | None = None
-    # True once the transfer has finished: from that point the local files are
-    # the only copy in existence, so a later failure keeps them rather than
-    # cleaning up the way a half-finished transfer does.
-    only_copy = False
-    try:
-        _set_job(job_id, status="resolving", message="Resolving magnet link…")
-        magnet = popcorn.magnet_for_result(result)
-        if not magnet:
-            raise RuntimeError("This source did not provide a magnet link.")
-        if _job_cancel_requested(job_id):
-            raise DownloadCancelled()
-
-        if upload_to:
-            download_dir = tempfile.mkdtemp(prefix="popcorn-web-", dir=ROOT)
-            _set_job(job_id, download_dir=download_dir)
-
-        command = ["aria2c", *popcorn.ARIA2_FLAGS, "--summary-interval=1"]
-        if download_dir:
-            command.append(f"--dir={download_dir}")
-        command.append(magnet)
-        _set_job(job_id, status="downloading", message="Download in progress…")
-        process = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
-        _register_job_process(job_id, process)
-        progress_pattern = re.compile(
-            r"(?P<done>[\d.]+\s*[KMGTP]?i?B)/(?P<total>[\d.]+\s*[KMGTP]?i?B)"
-            r"\((?P<pct>\d+)%\).*?DL:(?P<speed>[\d.]+\s*[KMGTP]?i?B)"
-            r"(?:.*?ETA:(?P<eta>[^\]\s]+))?",
-            re.IGNORECASE,
-        )
-        line = ""
-        saved_at = 0.0
-        assert process.stdout is not None
-        while True:
-            char = process.stdout.read(1)
-            if char == "" and process.poll() is not None:
-                break
-            if char not in ("\r", "\n"):
-                line += char
-                continue
-            match = progress_pattern.search(line)
-            if match:
-                values = match.groupdict()
-                percent = int(values["pct"])
-                # aria2 reports once a second and the browser reads the live
-                # figures from memory, so writing every report to disk buys
-                # nothing. Keep the frequent update in memory, and only
-                # persist one every few seconds.
-                now = time.time()
-                save = now - saved_at >= 5
-                _update_job(
-                    job_id,
-                    persist=save,
-                    progress=percent,
-                    speed=f"{values['speed']}/s",
-                    eta=values.get("eta") or "Calculating…",
-                    downloaded=values["done"],
-                    total=values["total"],
-                    message=f"Downloaded {values['done']} of {values['total']}",
-                )
-                if save:
-                    saved_at = now
-            line = ""
-        return_code = process.wait()
-        _unregister_job_process(job_id, process)
-        if _job_cancel_requested(job_id):
-            raise DownloadCancelled()
-        if return_code != 0:
-            raise RuntimeError(f"aria2c exited with status {return_code}.")
-
-        media_paths: list[str] = []
-        library_destination = False
-        if upload_to and download_dir:
-            normalized_upload = upload_to.rstrip("/")
-            if normalized_upload == LIBRARY_REMOTE or normalized_upload.startswith(f"{LIBRARY_REMOTE}/"):
-                library_destination = True
-                library_subdirectory = normalized_upload.removeprefix(LIBRARY_REMOTE).lstrip("/")
-                library_base = LIBRARY_PATH / library_subdirectory
-                media_paths = [
-                    str(library_base / path.relative_to(download_dir))
-                    for path in Path(download_dir).rglob("*")
-                    if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
-                ]
-                if media_paths:
-                    _set_job(job_id, media_paths=media_paths)
-            only_copy = True
-            _set_job(job_id, status="uploading", message=f"Uploading to {upload_to}…")
-            upload = subprocess.Popen(
-                ["rclone", "move", download_dir, upload_to, "-P",
-                 "--transfers=8", "--drive-chunk-size=128M"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            _register_job_process(job_id, upload)
-            upload_code = upload.wait()
-            _unregister_job_process(job_id, upload)
+    control = _job_control(job_id)
+    # The service uses one worker. This lease also protects recovery during
+    # overlapping gunicorn worker replacement and manual retries.
+    with (control / "worker.lock").open("a") as lease:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        try:
+            saved = JOBS[job_id]
+            download_dir = _owned_download_dir(saved.get("download_dir"))
             if _job_cancel_requested(job_id):
+                if download_dir and download_dir.exists():
+                    stop_transfer(download_dir)
+                upload_control = control / "upload"
+                if upload_control.exists():
+                    stop_transfer(upload_control)
                 raise DownloadCancelled()
-            if upload_code != 0:
-                raise RuntimeError(
-                    f"rclone exited with status {upload_code}; local files were kept."
-                )
-            shutil.rmtree(download_dir, ignore_errors=True)
-            download_dir = None
-            _set_job(job_id, download_dir=None)
-            _refresh_library_mount()
+            if not saved.get("download_complete"):
+                if download_dir is None:
+                    download_dir = Path(tempfile.mkdtemp(prefix="popcorn-web-", dir=ROOT))
+                    _set_job(job_id, download_dir=str(download_dir))
+                _set_job(job_id, status="resolving", message="Resolving download source…")
+                magnet = saved.get("resolved_magnet") or popcorn.magnet_for_result(result)
+                if not magnet:
+                    raise RuntimeError("The source did not provide a valid magnet.")
+                _set_job(job_id, resolved_magnet=magnet, status="downloading",
+                         message="Downloading (resuming saved pieces when available)…")
+                command = ["aria2c", *popcorn.ARIA2_FLAGS, "--summary-interval=1",
+                           f"--dht-file-path={control / 'dht.dat'}",
+                           f"--dht-file-path6={control / 'dht6.dat'}",
+                           f"--dir={download_dir}", magnet]
+                transfer = Transfer(download_dir, command)
+                _register_job_process(job_id, transfer)
+                saved_at = 0
+                while transfer.poll() is None:
+                    if _job_cancel_requested(job_id):
+                        transfer.terminate()
+                        transfer.wait()
+                        raise DownloadCancelled()
+                    matches = list(PROGRESS_PATTERN.finditer(transfer.progress()))
+                    if matches:
+                        values = matches[-1].groupdict()
+                        now = time.time()
+                        persist = now - saved_at >= 5
+                        _update_job(job_id, persist=persist, progress=int(values["pct"]),
+                                    speed=f"{values['speed']}/s", eta=values.get("eta") or "Calculating…",
+                                    downloaded=values["done"], total=values["total"])
+                        if persist:
+                            saved_at = now
+                    time.sleep(0.5)
+                _unregister_job_process(job_id, transfer)
+                code = transfer.wait()
+                if _job_cancel_requested(job_id):
+                    raise DownloadCancelled()
+                if code != 0:
+                    raise RuntimeError(f"The transfer stopped (aria2 status {code}). Saved pieces will be retried.")
+                _set_job(job_id, download_complete=True, retry_count=0, progress=100, speed="—", eta="—")
 
-        destination = upload_to or str(ROOT)
-        library_note = ""
-        library_item_id = None
-        if library_destination:
-            if _refresh_library(jellyfin_token):
-                _set_job(
-                    job_id,
-                    status="indexing",
-                    progress=100,
-                    speed="—",
-                    eta="Waiting for Jellyfin…",
-                    message="Download finished. Adding the movie to your watch library…",
-                )
-                library_item_id = _wait_for_library_item(
-                    media_paths, result.title, jellyfin_token
-                )
-                library_note = (
-                    " Ready to watch."
-                    if library_item_id
-                    else " Jellyfin is still updating; try the watch link shortly."
-                )
+            upload_source = download_dir
+            normalized_upload = upload_to.rstrip("/")
+            managed = normalized_upload in {LIBRARY_REMOTE, SHOWS_REMOTE}
+            if managed and not saved.get("upload_complete"):
+                if download_dir is None or not download_dir.exists():
+                    raise RuntimeError("The completed local files are missing. Restore them before retrying upload.")
+                stage = _prepare_tv_import(job_id, result, download_dir)
+                if stage:
+                    upload_source = stage
+                    upload_to = SHOWS_REMOTE
+                    normalized_upload = upload_to
+            if not saved.get("upload_complete") and upload_source and upload_source.exists():
+                _fetch_download_subtitles(job_id, result, upload_source)
+            library_destination = bool(upload_to) and any(
+                normalized_upload == remote or normalized_upload.startswith(f"{remote}/")
+                for remote in (LIBRARY_REMOTE, SHOWS_REMOTE))
+            media_paths = JOBS[job_id].get("media_paths", [])
+            if not saved.get("upload_complete"):
+                if upload_to:
+                    if download_dir is None or not download_dir.exists():
+                        raise RuntimeError("The completed local files are missing. Restore them before retrying upload.")
+                    if library_destination and not media_paths:
+                        base = LIBRARY_PATH / normalized_upload.removeprefix(LIBRARY_REMOTE).lstrip("/")
+                        media_paths = [str(base / path.relative_to(download_dir))
+                                       for path in download_dir.rglob("*")
+                                       if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS]
+                        _set_job(job_id, media_paths=media_paths)
+                    _set_job(job_id, status="uploading", message="Moving the finished files to your library…")
+                    upload_control = control / "upload"
+                    upload_control.mkdir(exist_ok=True)
+                    # Copy first, commit the remote-success checkpoint, then
+                    # remove local files. Retried copies skip matching files.
+                    upload = Transfer(upload_control, [
+                        "rclone", "copy", str(upload_source), upload_to,
+                        "--exclude=.transfer*", "--exclude=*.aria2", "--exclude=*.torrent",
+                        "--transfers=4", "--drive-chunk-size=32M", "--retries=3",
+                        "--low-level-retries=5", "--contimeout=10s", "--timeout=2m"])
+                    _register_job_process(job_id, upload)
+                    while upload.poll() is None:
+                        if _job_cancel_requested(job_id):
+                            upload.terminate()
+                            upload.wait()
+                            raise DownloadCancelled()
+                        time.sleep(0.5)
+                    code = upload.wait()
+                    _unregister_job_process(job_id, upload)
+                    if _job_cancel_requested(job_id):
+                        raise DownloadCancelled()
+                    if code != 0:
+                        raise RuntimeError(f"Upload stopped (rclone status {code}). Finished local files are kept.")
+                _set_job(job_id, upload_complete=True, retry_count=0)
+            if upload_to and download_dir and download_dir.exists():
+                # This deletion is safe only after durable remote success.
+                _remove_partial_download(str(download_dir))
+                _set_job(job_id, download_dir=None)
+            stage = control / "library-stage"
+            if upload_to and JOBS[job_id].get("upload_complete") and stage.exists():
+                shutil.rmtree(stage)
+            if library_destination:
+                _set_job(job_id, status="indexing", progress=100, speed="—",
+                         eta="Waiting for Jellyfin…", message="Adding the title to your library…")
+                _refresh_library_mount()
+                item_id = _find_library_item(media_paths, result.title, jellyfin_token)
+                if not item_id:
+                    if not _refresh_library(jellyfin_token):
+                        raise RuntimeError("The media server is unavailable. Library indexing will retry.")
+                    item_id = _wait_for_library_item(media_paths, result.title, jellyfin_token)
+                if not item_id:
+                    raise RuntimeError("The media server is still indexing. This stage will retry.")
+                _set_job(job_id, library_item_id=item_id)
                 preview_timer = threading.Timer(90, _trigger_trickplay, args=(jellyfin_token, True))
                 preview_timer.daemon = True
                 preview_timer.start()
-            else:
-                library_note = " The automatic library refresh failed; it will be retried on the next download."
-        _set_job(
-            job_id,
-            status="complete",
-            message=f"Finished. Saved to {destination}.{library_note}",
-            destination=destination,
-            library_item_id=library_item_id,
-            speed="—",
-            eta="—",
-            download_dir=None,
-        )
-    except DownloadCancelled:
-        _remove_partial_download(download_dir)
-        _set_job(
-            job_id,
-            status="cancelled",
-            message="Download cancelled. Partial local files were removed.",
-            speed="—",
-            eta="—",
-            download_dir=None,
-        )
-    except FileNotFoundError as exc:
-        _remove_partial_download(download_dir)
-        _set_job(job_id, status="failed", message=f"{exc.filename} is not installed.")
-    except Exception as exc:
-        app.logger.exception("Download job %s failed", job_id)
-        # Failures raised deliberately already read as sentences; anything else
-        # is an internal fault and is not shown as one. Either way the cause is
-        # in the log, and the viewer gets told what happened to their files.
-        message = str(exc) if isinstance(exc, RuntimeError) else "The download stopped unexpectedly."
-        if only_copy and download_dir:
-            message += f" The finished file is still in {download_dir}."
-        else:
-            _remove_partial_download(download_dir)
-            if download_dir:
-                message += " Partial local files were removed."
-                download_dir = None
-        _set_job(job_id, status="failed", message=message, download_dir=download_dir)
-    finally:
-        with STATE_LOCK:
-            JOB_PROCESSES.pop(job_id, None)
+            stage = control / "library-stage"
+            if stage.exists():
+                shutil.rmtree(stage)
+            _set_job(job_id, status="complete", progress=100, speed="—", eta="—",
+                     message="Ready to watch." if library_destination else "Download finished.",
+                     destination=upload_to or str(download_dir), retry_at=None, recoverable=False)
+        except media_library.IdentificationRequired as exc:
+            _set_job(job_id, status="needs_identification", media_kind="tv", retry_at=None, recoverable=False,
+                     speed="—", eta="—", message=str(exc) + " Finished files are kept locally.",
+                     identification_files=[p.name for p in download_dir.rglob("*")
+                                           if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS])
+        except DownloadCancelled:
+            saved = JOBS[job_id]
+            # Stop may discard partial downloads, never a completed local copy.
+            if not saved.get("download_complete"):
+                _remove_partial_download(saved.get("download_dir"))
+                _set_job(job_id, download_dir=None)
+            _set_job(job_id, status="cancelled", speed="—", eta="—", retry_at=None,
+                     message="Stopped. Finished local files were kept." if saved.get("download_complete")
+                     else "Stopped. Partial files were removed.", recoverable=False)
+        except Exception as exc:
+            # Do not log exception text: upstream URLs/commands can contain secrets.
+            app.logger.error("download_job_failed job_id=%s stage=%s error_type=%s",
+                             job_id, JOBS[job_id].get("status"), type(exc).__name__)
+            saved = JOBS[job_id]
+            attempts = saved.get("retry_count", 0) + 1
+            delay = min(JOB_RETRY_MAX, JOB_RETRY_BASE * 2 ** min(attempts - 1, 12))
+            stage = "indexing" if saved.get("upload_complete") else "uploading" if saved.get("download_complete") else "downloading" if saved.get("resolved_magnet") else "resolving"
+            message = str(exc) if isinstance(exc, RuntimeError) else "This stage stopped temporarily. Saved files are kept."
+            _set_job(job_id, status=stage, retry_count=attempts, retry_at=time.time() + delay,
+                     recoverable=True, speed="—", eta="—", message=f"{message} Retrying in {int(delay)} seconds.")
+        finally:
+            with STATE_LOCK:
+                JOB_PROCESSES.pop(job_id, None)
+
+
+def _start_download_job(job_id, token=None):
+    with STATE_LOCK:
+        saved = JOBS[job_id]
+        if job_id in JOB_WORKERS or len(JOB_WORKERS) >= JOB_MAX_WORKERS:
+            return False
+        if saved.get("kind") == "clips" or saved.get("status") in TERMINAL_JOB_STATES:
+            return False
+        result = popcorn.TorrentResult(**saved["release"]) if saved.get("release") else popcorn.TorrentResult(saved["title"])
+        upload_to = saved.get("destination", "")
+        JOB_WORKERS.add(job_id)
+    def run():
+        try:
+            _run_download(job_id, result, upload_to, token)
+        finally:
+            with STATE_LOCK:
+                JOB_WORKERS.discard(job_id)
+    threading.Thread(target=run, daemon=True, name=f"download-{job_id[:8]}").start()
+    return True
+
+
+def _recover_download_jobs():
+    while True:
+        try:
+            with STATE_LOCK:
+                ready = [j["id"] for j in JOBS.values()
+                         if j.get("kind") != "clips" and j.get("status") in ACTIVE_JOB_STATES
+                         and (j.get("retry_at") or 0) <= time.time()]
+            for job_id in ready:
+                _start_download_job(job_id)
+        except Exception as exc:
+            app.logger.error("job_recovery_failed error_type=%s", type(exc).__name__)
+        time.sleep(5)
 
 
 @app.post("/api/download")
@@ -1706,6 +1923,7 @@ def download():
         artwork = ""
     try:
         result_id = int(payload.get("result_id"))
+        identity = _tv_identity_payload(payload)
     except (TypeError, ValueError):
         return _error("Choose a search result first.")
 
@@ -1728,6 +1946,10 @@ def download():
             "source": result.source,
             "size": result.size,
             "destination": upload_to,
+            **identity,
+            "release": asdict(result),
+            "download_complete": False,
+            "upload_complete": False,
             "status": "queued",
             "message": "Download queued…",
             "progress": 0,
@@ -1738,22 +1960,74 @@ def download():
         }
         created_job = JOBS[job_id].copy()
 
-    _persist_job(created_job)
+    _persist_job(created_job, required=True)
+    _start_download_job(job_id, (session.get("jellyfin") or {}).get("token"))
+    return jsonify(_public_job(JOBS[job_id])), 202
 
-    threading.Thread(
-        target=_run_download,
-        args=(job_id, result, upload_to, (session.get("jellyfin") or {}).get("token")),
-        daemon=True,
-    ).start()
-    return jsonify(JOBS[job_id]), 202
+
+def _tv_identity_payload(payload):
+    kind = str(payload.get("media_kind", "auto"))
+    if kind not in {"auto", "movie", "tv"}:
+        raise ValueError("Unknown media type.")
+    tmdb_id = int(payload["show_tmdb_id"]) if payload.get("show_tmdb_id") else None
+    season = int(payload["tv_season"]) if payload.get("tv_season") not in {None, ""} else None
+    if (tmdb_id is not None and tmdb_id <= 0) or (season is not None and not 0 <= season <= 99):
+        raise ValueError("Invalid show or season.")
+    return {"media_kind": kind, "show_tmdb_id": tmdb_id, "tv_season": season,
+            "show_query": str(payload.get("show_query", "")).strip()[:200]}
+
+
+@app.get("/api/tv/search")
+@login_required
+def search_tv_identity():
+    query = media_library.show_query(request.args.get("q", ""))[:200]
+    if len(query) < 2:
+        return _error("Enter a TV show name.")
+    try:
+        shows = _tmdb_get("search/tv", query=query, include_adult="false").get("results", [])
+    except RuntimeError:
+        return _error("Show details are temporarily unavailable. Try again.", 502)
+    return jsonify({"shows": [{"id": s["id"], "title": s["name"],
+                               "year": (s.get("first_air_date") or "")[:4]} for s in shows[:12]]})
+
+
+@app.post("/api/jobs/<job_id>/identify")
+@login_required
+def identify_download(job_id):
+    connection = session.get("jellyfin") or {}
+    with STATE_LOCK:
+        saved = JOBS.get(job_id)
+        if not saved or saved.get("owner_user_id") != connection.get("user_id"):
+            return _error("Download job not found.", 404)
+        if saved.get("status") != "needs_identification" or job_id in JOB_WORKERS:
+            return _error("This job is not waiting for identification.", 409)
+    try:
+        payload = request.get_json(silent=True) or {}
+        identity = _tv_identity_payload(payload)
+        overrides = payload.get("episode_overrides", {})
+        if not isinstance(overrides, dict):
+            raise ValueError("Invalid episode mapping.")
+        for name, coord in overrides.items():
+            if name not in saved.get("identification_files", []) or not isinstance(coord, list) or len(coord) != 3:
+                raise ValueError("Unknown episode file.")
+            if not all(isinstance(v, int) and not isinstance(v, bool) for v in coord[:2]) or not 0 <= coord[0] <= 99 or not 1 <= coord[1] <= 999 or coord[2] is not None:
+                raise ValueError("Invalid episode number.")
+        identity["episode_overrides"] = overrides
+    except (ValueError, TypeError):
+        return _error("Choose a show and a valid season.")
+    identity["media_kind"] = "tv"
+    _set_job(job_id, **identity, show_metadata=None, identification_files=[], status="queued", retry_at=0,
+             cancel_requested=False, message="Organizing the saved TV episodes…")
+    _start_download_job(job_id, connection.get("token"))
+    return jsonify(_public_job(JOBS[job_id])), 202
 
 
 def _public_job(job: dict) -> dict:
     """A job as the interface needs it: no server paths, and a title written
     for a person rather than an indexer."""
     payload = {key: value for key, value in job.items()
-               if key not in {"download_dir", "media_paths", "work_dir", "cancel_requested"}}
-    payload["display_title"] = _display_title(job.get("title", "")) or job.get("title", "")
+               if key not in {"download_dir", "media_paths", "work_dir", "cancel_requested", "release", "resolved_magnet", "show_metadata", "import_plan", "episode_overrides"}}
+    payload["display_title"] = (job.get("show_metadata") or {}).get("name") or _display_title(job.get("title", "")) or job.get("title", "")
     if job.get("kind") == "clips":
         payload["notes"] = (job.get("notes") or [])[-6:]
     return payload
@@ -1809,10 +2083,32 @@ def cancel_job(job_id: str):
     _persist_job(snapshot)
     if process and process.poll() is None:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            if isinstance(process, Transfer):
+                # Worker polls cancellation and performs the supervised stop.
+                pass
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-    return jsonify(snapshot), 202
+    return jsonify(_public_job(snapshot)), 202
+
+
+@app.post("/api/jobs/<job_id>/retry")
+@login_required
+def retry_job(job_id):
+    with STATE_LOCK:
+        current = JOBS.get(job_id)
+        connection = session.get("jellyfin") or {}
+        if not current or (current.get("owner_user_id") != connection.get("user_id")
+                           and not (current.get("owner_user_id") is None and connection.get("is_admin"))):
+            return _error("Download job not found.", 404)
+        if current.get("kind") == "clips" or not (current.get("release") or current.get("download_complete")):
+            return _error("This older job cannot be resumed automatically.", 409)
+        if current.get("status") in {"complete", "cancelled", "cancelling"} or job_id in JOB_WORKERS:
+            return _error("This job is already running or finished.", 409)
+    _set_job(job_id, status="queued", retry_at=0, cancel_requested=False, message="Resuming saved work…")
+    _start_download_job(job_id, connection.get("token"))
+    return jsonify(_public_job(JOBS[job_id])), 202
 
 
 @app.delete("/api/jobs/<job_id>")
@@ -2055,6 +2351,8 @@ def _art(item: dict, kind: str) -> dict | None:
         # movie, Primary is a poster and would be badly cropped here, so only a
         # real Thumb image or the parent's backdrop will do.
         tag = tags.get("Primary") if item.get("Type") == "Episode" else tags.get("Thumb")
+        if tag and item.get("Type") == "Episode":
+            image_type = "Primary"
         if not tag and parent_id and parent_tags:
             item_id, tag, image_type = parent_id, parent_tags[0], "Backdrop"
     elif kind == "logo":
@@ -2066,7 +2364,8 @@ def _art(item: dict, kind: str) -> dict | None:
         return None
 
     def url(width: int) -> str:
-        return url_for("library_art", item_id=item_id, kind=kind, tag=tag, w=width)
+        route_kind = next(key for key, value in IMAGE_KINDS.items() if value == image_type)
+        return url_for("library_art", item_id=item_id, kind=route_kind, tag=tag, w=width)
 
     return {
         "src": url(IMAGE_WIDTHS[kind][1]),
@@ -2748,7 +3047,8 @@ def media_proxy(rest: str):
             response.headers[header] = upstream.headers[header]
     # Seeking needs the browser to know the resource is range-capable.
     response.headers.setdefault("Accept-Ranges", "bytes")
-    response.headers["Cache-Control"] = "no-store"
+    response.headers["Cache-Control"] = "private, max-age=86400" if "/Trickplay/" in rest and upstream.status_code == 200 else "no-store"
+    response.call_on_close(upstream.close)
     return response
 
 
@@ -2960,7 +3260,7 @@ def library_play(item_id: str):
     subtitles, audio = _playback_tracks(item_id, source)
     stream = _stream_urls(item_id, source, play_session)
 
-    item = _library_json(f"Users/{user_id}/Items/{item_id}", Fields="RunTimeTicks,MediaSources")
+    item = _library_json(f"Users/{user_id}/Items/{item_id}", Fields="RunTimeTicks,MediaSources,Trickplay,Path")
     user_data = item.get("UserData") or {}
     runtime_ticks = item.get("RunTimeTicks") or source.get("RunTimeTicks") or 0
     start_ticks = body["StartTimeTicks"] or (user_data.get("PlaybackPositionTicks") or 0)
@@ -2985,6 +3285,7 @@ def library_play(item_id: str):
     return jsonify({
         "item_id": item_id,
         "media_source_id": source.get("Id"),
+        "previews": _preview_descriptor(item, source.get("Id")),
         "play_session_id": play_session,
         "mode": stream["mode"],
         "method": stream["method"],
@@ -3000,6 +3301,75 @@ def library_play(item_id: str):
         "video_reencoded": _video_is_reencoded(source),
         "player": {"title": item.get("Name"), "item": _public_item(item)},
     })
+
+
+def _imported_preview_entry(item, source_id):
+    source = next((s for s in item.get("MediaSources", []) if s.get("Id") == source_id), None)
+    if not source and source_id != item.get("Id"):
+        return None
+    source_path = source.get("Path") if source else item.get("Path")
+    if _ITEM_ID.fullmatch(source_id or ""):
+        generated = ROOT / "data" / "preview-cache" / source_id / "manifest.json"
+        try:
+            entry = json.loads(generated.read_text())
+            if entry.get("media_path") == source_path and entry.get("previews"):
+                return {**entry, "cache_type": "generated"}
+        except (OSError, ValueError):
+            pass
+    manifest = ROOT / "data" / "tv-migration" / "manifest.json"
+    try:
+        entries = json.loads(manifest.read_text()).get("entries", [])
+    except (OSError, ValueError):
+        return None
+    return next((e for e in entries if e.get("previews")
+                 and source_path == str(SHOWS_PATH / e.get("relative", ""))), None)
+
+
+@app.get("/api/previews/<item_id>/<source_id>/<int:index>.jpg")
+@login_required
+@_library_guard
+def imported_preview_image(item_id, source_id, index):
+    if not _ITEM_ID.fullmatch(item_id) or not _ITEM_ID.fullmatch(source_id):
+        return _error("Unknown preview.", 404)
+    user_id = _library_connection().get("user_id")
+    item = _library_json(f"Users/{user_id}/Items/{item_id}", Fields="Path,MediaSources")
+    entry = _imported_preview_entry(item, source_id)
+    if not entry:
+        return _error("Preview is unavailable.", 404)
+    info = entry["previews"]
+    sheets = (info["count"] + info["columns"] * info["rows"] - 1) // (info["columns"] * info["rows"])
+    asset = info["asset_id"]
+    if index >= sheets or not _ITEM_ID.fullmatch(asset):
+        return _error("Unknown preview.", 404)
+    base = ROOT / "data" / "preview-cache" if entry.get("cache_type") == "generated" else ROOT / "data" / "tv-migration" / "previews"
+    path = base / asset / f"{index}.jpg"
+    if not path.is_file():
+        return _error("Preview is unavailable.", 404)
+    response = send_file(path, mimetype="image/jpeg", max_age=86400)
+    response.headers["Cache-Control"] = "private, max-age=86400"
+    return response
+
+
+def _preview_descriptor(item, source_id):
+    # A different version may have a different timeline: never use another source's frames.
+    sizes = (item.get("Trickplay") or {}).get(source_id, {})
+    if not sizes:
+        entry = _imported_preview_entry(item, source_id)
+        if not entry:
+            return None
+        values = {k: v for k, v in entry["previews"].items() if k != "asset_id"}
+        values["url"] = f"/api/previews/{item['Id']}/{source_id}/{{index}}.jpg"
+        return values
+    options = sorted((int(width), info) for width, info in sizes.items() if str(width).isdigit())
+    if not options:
+        return None
+    width, info = next(((w, i) for w, i in options if w >= 200), options[-1])
+    values = {"width": width, "height": info.get("Height"), "columns": info.get("TileWidth"),
+              "rows": info.get("TileHeight"), "count": info.get("ThumbnailCount"), "interval": info.get("Interval")}
+    if not all(isinstance(v, int) and v > 0 for v in values.values()):
+        return None
+    values["url"] = f"/media/Videos/{item['Id']}/Trickplay/{width}/{{index}}.jpg?MediaSourceId={source_id}"
+    return values
 
 
 def _next_episode_in_sequence(item: dict, user_id: str) -> dict | None:
@@ -4035,6 +4405,11 @@ def clip_thumb(clip_id: str):
     response = send_file(path, mimetype="image/jpeg", conditional=True, max_age=604800)
     response.headers["Cache-Control"] = "private, max-age=604800"
     return response
+
+
+_init_state()
+if os.environ.get("POPCORN_JOB_RECOVERY", "1") == "1":
+    threading.Thread(target=_recover_download_jobs, daemon=True, name="job-recovery").start()
 
 
 if __name__ == "__main__":

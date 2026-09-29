@@ -292,6 +292,10 @@ let controller = null;
 let torrentToken = 0;
 
 async function run(query) {
+  debouncedRun.cancel();
+  controller?.abort();
+  const token = ++torrentToken;
+  searchId = null;
   const trimmed = query.trim();
   currentQuery = trimmed;
   clearButton.hidden = !trimmed;
@@ -302,9 +306,7 @@ async function run(query) {
     return;
   }
 
-  controller?.abort();
   controller = new AbortController();
-  const token = ++torrentToken;
 
   // Library results are local and fast; show them while the indexes are still
   // being scraped.
@@ -339,6 +341,11 @@ async function run(query) {
     if (group) nodes.push(group);
   }
 
+  const pending = h('section', { class: 'result-group' },
+    h('div', { class: 'result-group-head' }, h('h2', { text: 'Searching available releases…' })),
+  );
+  replace(results, [...nodes, pending]);
+
   const torrents = await torrentPromise;
   if (token !== torrentToken) return;
 
@@ -372,8 +379,7 @@ const debouncedRun = debounce(() => run(input.value), 420);
 input.addEventListener('input', () => {
   clearButton.hidden = !input.value.trim();
   if (input.value.trim().length < 2) {
-    currentQuery = '';
-    renderLanding();
+    run(input.value);
     return;
   }
   debouncedRun();
@@ -381,9 +387,7 @@ input.addEventListener('input', () => {
 
 clearButton.addEventListener('click', () => {
   input.value = '';
-  currentQuery = '';
-  clearButton.hidden = true;
-  renderLanding();
+  run('');
   input.focus();
 });
 

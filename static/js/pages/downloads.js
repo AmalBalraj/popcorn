@@ -1,11 +1,11 @@
-import { get, del } from '../core/api.js';
+import { get, post, del } from '../core/api.js';
 import { h, replace, clear, formatBytes, parseSize, relativeTime, joinMeta } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { statePanel, errorPanel } from '../components/state.js';
 import { confirmDialog } from '../components/modal.js';
 import { showToast, toastError } from '../core/toast.js';
 import {
-  STAGE_LABELS, stageDescription, stageTrack, isTerminal, cancelDownload, loadJobs,
+  STAGE_LABELS, stageDescription, stageTrack, isTerminal, cancelDownload, loadJobs, identifyDownload,
 } from '../core/downloads.js';
 
 /* Download manager.
@@ -72,6 +72,21 @@ function downloadRow(job) {
 
   const actions = h('div', { class: 'download-actions' });
 
+  if (job.status === 'needs_identification') {
+    actions.append(h('button', { class: 'btn btn-primary btn-sm', type: 'button',
+      onclick: async () => { if (await identifyDownload(job)) await refresh(); } }, 'Identify show'));
+  }
+
+  if (job.recoverable) {
+    actions.append(h('button', {
+      class: 'btn btn-outline btn-sm', type: 'button',
+      onclick: async () => {
+        try { await post(`/api/jobs/${job.id}/retry`); await refresh(); }
+        catch (error) { toastError(error); }
+      },
+    }, 'Retry now'));
+  }
+
   if (!terminal) {
     actions.append(h('button', {
       class: 'btn btn-outline btn-sm',
@@ -81,7 +96,9 @@ function downloadRow(job) {
         const button = event.currentTarget;
         const confirmed = await confirmDialog({
           title: 'Stop this download?',
-          message: 'Partial files will be removed. You can start it again from Search.',
+          message: job.download_complete
+            ? 'Finished local files will be kept. Files already uploaded remain in your library.'
+            : 'Partial files will be removed. You can start it again from Search.',
           confirmLabel: 'Stop download',
         });
         if (!confirmed) return;
@@ -95,9 +112,9 @@ function downloadRow(job) {
   }
 
   if (job.status === 'complete') {
-    const target = job.library_item_id ? `/movie/${job.library_item_id}` : '/movies';
+    const target = job.library_item_id ? `/${job.media_kind === 'tv' ? 'show' : 'movie'}/${job.library_item_id}` : (job.media_kind === 'tv' ? '/shows' : '/movies');
     actions.append(h('a', { class: 'btn btn-primary btn-sm', href: target },
-      icon('play', { size: 15 }), 'Play'));
+      icon('play', { size: 15 }), job.media_kind === 'tv' ? 'View episodes' : 'Play'));
   }
 
   if (['failed', 'cancelled', 'interrupted'].includes(job.status)) {
@@ -124,6 +141,11 @@ function downloadRow(job) {
   }
 
   const stats = [];
+  const subtitles = job.subtitles_summary;
+  if (subtitles?.downloaded) stats.push(h('span', { text: `${subtitles.downloaded} subtitle file${subtitles.downloaded === 1 ? '' : 's'} added` }));
+  else if (subtitles?.status === 'not_configured') stats.push(h('a', { href: '/settings#subtitles', text: 'Connect subtitle account' }));
+  else if (subtitles?.no_match) stats.push(h('span', { text: 'Matching subtitles unavailable' }));
+  else if (subtitles?.message) stats.push(h('span', { text: subtitles.message }));
   if (!terminal) {
     stats.push(h('strong', { text: `${percent}%` }));
     if (job.speed && job.speed !== '—') stats.push(h('span', { text: job.speed }));

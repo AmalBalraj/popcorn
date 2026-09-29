@@ -1,0 +1,33 @@
+[Unit]
+Description=Popcorn TV show library mount
+After=network-online.target
+Wants=network-online.target
+Before=jellyfin.service
+
+[Service]
+Type=notify
+User=amal
+Group=amal
+ExecStart=/usr/bin/rclone mount "gdrive:TV Shows" /home/amal/gdrive-shows \
+    --config=/home/amal/.config/rclone/rclone.conf \
+    --read-only \
+    --allow-other \
+    --umask=022 \
+    --dir-cache-time=24h \
+    --poll-interval=1m \
+    --rc \
+    --rc-addr=127.0.0.1:5573 \
+    --buffer-size=64M \
+    --vfs-cache-mode=full \
+    --vfs-read-ahead=256M \
+    --vfs-read-chunk-size=64M \
+    --vfs-read-chunk-size-limit=1G \
+    --vfs-cache-max-size=32G \
+    --vfs-cache-max-age=72h \
+    --cache-dir=/home/amal/.cache/rclone-jellyfin-shows
+ExecStop=/bin/fusermount -uz /home/amal/gdrive-shows
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

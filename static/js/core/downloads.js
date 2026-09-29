@@ -12,12 +12,15 @@ import { showToast, toastError } from './toast.js';
  */
 
 /** The journey a download takes, in the order a person experiences it. */
-export const STAGES = ['queued', 'resolving', 'downloading', 'uploading', 'indexing', 'complete'];
+export const STAGES = ['queued', 'resolving', 'downloading', 'identifying', 'subtitles', 'uploading', 'indexing', 'complete'];
 
 export const STAGE_LABELS = {
   queued: 'Queued',
   resolving: 'Finding sources',
   downloading: 'Downloading',
+  identifying: 'Organizing episodes',
+  subtitles: 'Finding subtitles',
+  needs_identification: 'Choose TV show',
   uploading: 'Moving to your library',
   indexing: 'Almost ready',
   complete: 'Ready to watch',
@@ -29,18 +32,22 @@ export const STAGE_LABELS = {
 
 /** Short, human explanation of what is happening right now. */
 export function stageDescription(job) {
+  if (job.recoverable && job.retry_at) return job.message || 'Waiting to retry this stage.';
   switch (job.status) {
     case 'queued': return 'Waiting to start.';
     case 'resolving': return 'Looking for the best available sources.';
     case 'downloading': return job.speed && job.speed !== '—'
       ? `Downloading at ${job.speed}${job.eta && job.eta !== '—' ? ` · ${job.eta} remaining` : ''}`
       : 'Downloading…';
+    case 'identifying': return 'Matching the show and organizing its seasons and episodes.';
+    case 'subtitles': return job.message || 'Finding subtitles that match your video release.';
+    case 'needs_identification': return job.message || 'Choose the correct TV show. Finished files are kept.';
     case 'uploading': return 'Sending the finished file to your library.';
     case 'indexing': return 'Your media server is adding it to the library.';
     case 'complete': return 'Ready to play in your library.';
     case 'cancelling': return 'Stopping and cleaning up partial files.';
-    case 'cancelled': return 'Stopped. Partial files were removed.';
-    case 'interrupted': return 'The server restarted before this finished.';
+    case 'cancelled': return job.message || 'Stopped.';
+    case 'interrupted': return job.message || 'The server restarted before this finished.';
     case 'failed': return job.message || 'Something went wrong.';
     default: return job.message || '';
   }
@@ -50,6 +57,7 @@ export function stageIndex(status) {
   const index = STAGES.indexOf(status);
   if (index !== -1) return index;
   if (status === 'cancelling') return 2;
+  if (status === 'needs_identification') return 3;
   if (status === 'complete') return STAGES.length - 1;
   return -1;
 }
@@ -95,10 +103,6 @@ export function releaseSummary(release) {
  * The best release is preselected, so the common path is one click.
  */
 export async function chooseReleaseAndDownload({ title, year, releases, searchId, poster }) {
-  if (releases.length === 1) {
-    return startDownload({ searchId, release: releases[0], title, poster });
-  }
-
   const byResolution = new Map();
   for (const release of releases) {
     const key = release.resolution || 'Other';
@@ -107,6 +111,7 @@ export async function chooseReleaseAndDownload({ title, year, releases, searchId
   }
 
   let chosen = releases[0];
+  const identity = tvIdentityFields(title, releases.some(r => ['tv', 'episode', 'season'].includes(r.media_type)) ? 'tv' : 'auto');
 
   return new Promise((resolve) => {
     const dialog = openModal({
@@ -114,6 +119,7 @@ export async function chooseReleaseAndDownload({ title, year, releases, searchId
       wide: true,
       body: ({ close }) => {
         const fragment = document.createDocumentFragment();
+        fragment.append(identity.node);
 
         fragment.append(h('p', {
           class: 't-dim',
@@ -176,8 +182,11 @@ export async function chooseReleaseAndDownload({ title, year, releases, searchId
           label: 'Start download',
           primary: true,
           onClick: async ({ close }) => {
-            close();
-            resolve(await startDownload({ searchId, release: chosen, title, poster }));
+            const button = dialog.panel.querySelector('.btn-primary');
+            button.disabled = true;
+            const job = await startDownload({ searchId, release: chosen, title, poster, identity: identity.value() });
+            if (job) { resolve(job); close(); }
+            else button.disabled = false;
           },
         },
       ],
@@ -187,12 +196,13 @@ export async function chooseReleaseAndDownload({ title, year, releases, searchId
   });
 }
 
-export async function startDownload({ searchId, release, title, poster }) {
+export async function startDownload({ searchId, release, title, poster, identity = {} }) {
   try {
     const job = await post('/api/download', {
       search_id: searchId,
       result_id: release.id,
       poster: poster || '',
+      ...identity,
     });
     showToast(`Downloading ${title}`, {
       tone: 'success',
@@ -201,7 +211,7 @@ export async function startDownload({ searchId, release, title, poster }) {
     return job;
   } catch (error) {
     toastError(error, {
-      onRetry: () => startDownload({ searchId, release, title, poster }),
+      onRetry: () => startDownload({ searchId, release, title, poster, identity }),
     });
     return null;
   }
@@ -224,4 +234,65 @@ export function actionButton({ name, label, onClick, primary = false, danger = f
     title: label,
     onclick: onClick,
   }, iconName ? icon(iconName, { size: 15 }) : null, name || label);
+}
+
+
+function tvIdentityFields(title, initialKind = 'tv') {
+  const kind = h('select', { class: 'input', 'aria-label': 'Media type' },
+    h('option', { value: 'auto', text: 'Detect automatically' }),
+    h('option', { value: 'tv', text: 'TV show' }),
+    h('option', { value: 'movie', text: 'Movie' }));
+  kind.value = initialKind;
+  const query = h('input', { class: 'input', type: 'search', value: title.replace(/[._]/g, ' ').split(/\bS\d|\bSeason\b|\b20\d{2}\b/i)[0].trim(),
+    placeholder: 'TV show name', 'aria-label': 'TV show name' });
+  const season = h('input', { class: 'input', type: 'number', min: 0, max: 99,
+    placeholder: 'Season, if filenames omit it', 'aria-label': 'Season for files without season numbers' });
+  const matches = h('select', { class: 'input', 'aria-label': 'Choose the correct TV show', hidden: true });
+  const notice = h('p', { class: 't-dim t-sm' });
+  const lookup = h('button', { class: 'btn btn-outline btn-sm', type: 'button', text: 'Find show', onclick: async () => {
+    lookup.disabled = true;
+    try {
+      const data = await get(`/api/tv/search?q=${encodeURIComponent(query.value)}`);
+      replaceSelect(data.shows);
+      notice.textContent = data.shows.length ? 'Choose the matching show. Releases from other sources will join this series.' : 'No matching show found. Try a different name.';
+    } catch (error) { notice.textContent = error.message; }
+    finally { lookup.disabled = false; }
+  } });
+  const replaceSelect = (shows) => {
+    matches.replaceChildren(h('option', { value: '', text: 'Choose a show…' }),
+      ...shows.map(show => h('option', { value: show.id, text: `${show.title}${show.year ? ` (${show.year})` : ''}` })));
+    matches.hidden = !shows.length;
+  };
+  query.addEventListener('input', () => { matches.value = ''; matches.hidden = true; });
+  const tv = h('div', { style: { display: 'grid', gap: 'var(--s3)', marginTop: 'var(--s3)' } }, query, lookup, matches, season, notice);
+  const update = () => { tv.hidden = kind.value !== 'tv'; };
+  kind.addEventListener('change', update);
+  update();
+  const node = h('div', { style: { marginBottom: 'var(--s5)' } }, h('label', { class: 't-label', text: 'Add to library as' }), kind, tv);
+  return { node, value: () => ({ media_kind: kind.value, show_query: query.value,
+    show_tmdb_id: matches.value || null, tv_season: season.value === '' ? null : Number(season.value) }) };
+}
+
+export function identifyDownload(job) {
+  const identity = tvIdentityFields(job.display_title || job.title);
+  const fileFields = (job.identification_files || []).map(name => {
+    const season = h('input', { class: 'input', type: 'number', min: 0, max: 99, placeholder: 'Season', 'aria-label': `Season for ${name}` });
+    const episode = h('input', { class: 'input', type: 'number', min: 1, max: 999, placeholder: 'Episode', 'aria-label': `Episode for ${name}` });
+    identity.node.append(h('div', { style: { marginTop: 'var(--s3)' } }, h('p', { class: 't-sm', text: name }), season, episode));
+    return { name, season, episode };
+  });
+  return new Promise(resolve => {
+    openModal({ title: 'Identify TV show', body: identity.node,
+      actions: [{ label: 'Cancel', onClick: ({ close }) => close() }, {
+        label: 'Import episodes', primary: true, onClick: async ({ close }) => {
+          try {
+            const value = identity.value();
+            value.episode_overrides = Object.fromEntries(fileFields.filter(f => f.season.value !== '' && f.episode.value !== '')
+              .map(f => [f.name, [Number(f.season.value), Number(f.episode.value), null]]));
+            await post(`/api/jobs/${job.id}/identify`, value); resolve(true); close();
+          }
+          catch (error) { toastError(error); }
+        },
+      }], onClose: () => resolve(false) });
+  });
 }

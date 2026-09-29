@@ -46,17 +46,10 @@ async function loadSettings() {
     const languageSelect = document.getElementById('subtitle_language');
     languageSelect.dataset.current = settings.subtitle_language;
     fillLanguages();
-    const toggleLabel = document.getElementById('private_dns_label');
-    if (toggleLabel) toggleLabel.textContent = settings.private_dns ? 'On' : 'Off';
   } catch (error) {
     status.textContent = error.message;
   }
 }
-
-const privateDns = document.getElementById('private_dns');
-privateDns?.addEventListener('change', () => {
-  document.getElementById('private_dns_label').textContent = privateDns.checked ? 'On' : 'Off';
-});
 
 const clipVision = document.getElementById('clip_vision');
 clipVision?.addEventListener('change', () => {
@@ -68,6 +61,13 @@ clipSubtitles?.addEventListener('change', () => {
   document.getElementById('clip_subtitle_download_label').textContent = clipSubtitles.checked ? 'On' : 'Off';
 });
 
+const automaticSubtitles = document.getElementById('subtitle_auto_download');
+function updateSubtitleSwitch() {
+  if (automaticSubtitles) automaticSubtitles.closest('.switch').querySelector('.switch-text').textContent = automaticSubtitles.checked ? 'On' : 'Off';
+}
+automaticSubtitles?.addEventListener('change', updateSubtitleSwitch);
+updateSubtitleSwitch();
+
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   const button = form.querySelector('button[type="submit"]');
@@ -76,10 +76,10 @@ form.addEventListener('submit', async (event) => {
   status.textContent = 'Saving…';
   try {
     const result = await put('/api/settings', {
+      ...(isAdmin ? { subtitle_auto_download: data.has('subtitle_auto_download') } : {}),
       default_upload: data.get('default_upload'),
       default_source: data.get('default_source'),
       search_timeout: Number(data.get('search_timeout')),
-      private_dns: data.has('private_dns'),
       subtitle_language: data.get('subtitle_language'),
       subtitle_mode: data.get('subtitle_mode'),
       clip_target_count: Number(data.get('clip_target_count')),
@@ -100,6 +100,56 @@ form.addEventListener('submit', async (event) => {
     button.disabled = false;
   }
 });
+
+/* Automatic subtitle downloads use one administrator-owned provider account. */
+const subtitleAccountForm = document.getElementById('subtitle-account-form');
+let subtitlePoll;
+function renderSubtitleAccount(data) {
+  document.getElementById('subtitle-account-status').textContent = data.connected
+    ? `Connected as ${data.username}.` : 'Connect your account to activate automatic subtitle downloads.';
+  document.getElementById('subtitle-disconnect').disabled = !data.connected;
+  const scan = data.scan || {};
+  document.getElementById('subtitle-scan').disabled = !data.connected || scan.status === 'running';
+  const label = document.getElementById('subtitle-scan-status');
+  if (scan.status === 'running') label.textContent = `Checking ${scan.checked || 0} of ${scan.total || 0} videos… ${scan.downloaded || 0} subtitles added.`;
+  else if (scan.status === 'complete') label.textContent = `${scan.downloaded || 0} subtitles added; ${scan.existing || 0} already had subtitles; ${scan.no_match || 0} had no matching release.`;
+  else label.textContent = scan.message || '';
+  clearTimeout(subtitlePoll);
+  if (scan.status === 'running') subtitlePoll = setTimeout(loadSubtitleAccount, 3000);
+}
+async function loadSubtitleAccount() {
+  if (!subtitleAccountForm) return;
+  try { renderSubtitleAccount(await get('/api/subtitles/account')); }
+  catch (error) { document.getElementById('subtitle-account-status').textContent = error.message; }
+}
+subtitleAccountForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = subtitleAccountForm.querySelector('button[type=submit]');
+  const label = document.getElementById('subtitle-account-status');
+  const values = Object.fromEntries(new FormData(subtitleAccountForm));
+  button.disabled = true;
+  label.textContent = 'Checking your OpenSubtitles account…';
+  try {
+    const data = await post('/api/subtitles/account', values);
+    subtitleAccountForm.reset();
+    if (automaticSubtitles) { automaticSubtitles.checked = true; updateSubtitleSwitch(); }
+    renderSubtitleAccount(data);
+    showToast(data.message);
+    await loadSubtitleAccount();
+  } catch (error) { label.textContent = error.message; }
+  finally { button.disabled = false; }
+});
+document.getElementById('subtitle-disconnect')?.addEventListener('click', async () => {
+  try { await del('/api/subtitles/account'); await loadSubtitleAccount(); }
+  catch (error) { document.getElementById('subtitle-account-status').textContent = error.message; }
+});
+document.getElementById('subtitle-scan')?.addEventListener('click', async (event) => {
+  event.currentTarget.disabled = true;
+  try { await post('/api/subtitles/scan'); await loadSubtitleAccount(); }
+  catch (error) { document.getElementById('subtitle-scan-status').textContent = error.message; event.currentTarget.disabled = false; }
+});
+loadSubtitleAccount();
+window.addEventListener('pagehide', () => clearTimeout(subtitlePoll));
 
 /* ── Account ────────────────────────────────────────────────────────────── */
 

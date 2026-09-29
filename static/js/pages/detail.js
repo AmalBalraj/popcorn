@@ -376,7 +376,7 @@ function versionsBlock() {
           h('strong', { text: version.name || joinMeta([version.video, version.container], ' · ') || 'Version' }),
           h('small', { text: joinMeta([version.video, formatBytes(version.size), formatRuntime(version.runtime_minutes)]) }),
         ),
-        h('a', { class: 'btn btn-sm btn-outline', href: playHref(item) }, 'Play'),
+        h('a', { class: 'btn btn-sm btn-outline', href: `${playHref(item)}?source=${encodeURIComponent(version.id)}` }, 'Play'),
       ),
     )),
   );
@@ -402,7 +402,10 @@ function episodesBlock() {
       .sort((a, b) => a - b)
       .map((index) => ({ index, name: `Season ${index}` }));
 
-  const current = seasons.find((season) => season.index === activeSeason) || seasons[0];
+  const current = seasons.find((season) => season.index === activeSeason)
+    || seasons.find((season) => season.index === item.next_up?.parent_index_number)
+    || seasons.find((season) => season.index > 0)
+    || seasons[0];
   activeSeason = current?.index ?? null;
 
   const tabs = h('div', { class: 'segmented season-tabs', role: 'tablist', 'aria-label': 'Seasons' });

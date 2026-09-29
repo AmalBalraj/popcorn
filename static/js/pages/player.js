@@ -2,6 +2,7 @@ import { get, post } from '../core/api.js';
 import { h, formatTimecode, replace, joinMeta } from '../core/dom.js';
 import { statePanel } from '../components/state.js';
 import { showToast } from '../core/toast.js';
+import { previewFrame } from '../core/previews.js';
 import { episodeLabel } from '../core/items.js';
 
 /* The player.
@@ -22,6 +23,34 @@ const playedBar = document.getElementById('player-played');
 const bufferBar = document.getElementById('player-buffer');
 const handle = document.getElementById('player-handle');
 const tooltip = document.getElementById('player-tooltip');
+const previewImage = h('div', { class: 'player-preview-image', hidden: true });
+const previewTime = h('span');
+tooltip.append(previewImage, previewTime);
+const previewSheets = new Map();
+let wantedPreview = null;
+function paintPreview(time) {
+  const frame = previewFrame(session?.previews, time);
+  wantedPreview = frame;
+  previewTime.textContent = formatTimecode(time);
+  previewImage.hidden = true;
+  if (!frame) return;
+  const paint = () => {
+    if (wantedPreview?.url !== frame.url) return;
+    const current = wantedPreview;
+    Object.assign(previewImage.style, { width: `${current.width}px`, height: `${current.height}px`,
+      backgroundImage: `url("${current.url}")`, backgroundSize: current.size, backgroundPosition: current.position });
+    previewImage.hidden = false;
+  };
+  let image = previewSheets.get(frame.url);
+  if (!image) {
+    image = new Image();
+    previewSheets.set(frame.url, image);
+    image.onload = paint;
+    image.src = frame.url;
+    if (previewSheets.size > 8) previewSheets.delete(previewSheets.keys().next().value);
+  }
+  if (image.complete && image.naturalWidth) paint();
+}
 const elapsedLabel = document.getElementById('player-elapsed');
 const remainingLabel = document.getElementById('player-remaining');
 const toggleIcon = document.getElementById('player-toggle-icon');
@@ -94,6 +123,8 @@ function capabilities() {
  */
 async function negotiate({ audioIndex = null, maxBitrate = null, maxHeight = null } = {}) {
   const body = { capabilities: capabilities() };
+  const source = new URLSearchParams(location.search).get('source');
+  if (source && /^[a-fA-F0-9-]{32,36}$/.test(source)) body.media_source_id = source;
   if (audioIndex !== null) body.audio_index = audioIndex;
   if (maxBitrate) body.max_bitrate = maxBitrate;
   if (maxHeight !== null) body.max_height = maxHeight;
@@ -259,9 +290,9 @@ scrub.addEventListener('pointermove', (event) => {
   if (!duration()) return;
   const { ratio, time } = pointerTime(event);
   tooltip.hidden = false;
-  tooltip.textContent = formatTimecode(time);
+  paintPreview(time);
   const rect = scrub.getBoundingClientRect();
-  const x = Math.min(Math.max(event.clientX - rect.left, 40), rect.width - 40);
+  const x = Math.min(Math.max(event.clientX - rect.left, session?.previews ? 106 : 40), rect.width - (session?.previews ? 106 : 40));
   tooltip.style.left = `${x}px`;
   if (seeking !== null) {
     seeking = time;
@@ -276,6 +307,8 @@ scrub.addEventListener('pointerdown', (event) => {
   scrub.setPointerCapture(event.pointerId);
   scrub.classList.add('is-scrubbing');
   seeking = pointerTime(event).time;
+  tooltip.hidden = false;
+  paintPreview(seeking);
   paintProgress();
   showControls();
 });
